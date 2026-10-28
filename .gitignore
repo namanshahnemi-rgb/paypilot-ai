@@ -1,0 +1,16 @@
+.env
+.env.*
+!.env.example
+node_modules/
+dist/
+# Test output and logs
+coverage/
+*.log
+npm-debug.log*
+
+# Local environment files
+.DS_Store
+Thumbs.db
+
+# Local editor settings
+.vscode/
