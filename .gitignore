@@ -14,3 +14,12 @@ Thumbs.db
 
 # Local editor settings
 .vscode/
+# PayPilot AI local database
+server/data/
+*.db
+*.db-shm
+*.db-wal
+
+# Local backup files
+*.backup
+*.backup.*

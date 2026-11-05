@@ -1,19 +1,15 @@
-// Registry of PayPal orders created by this backend, with their verified
-// payment status.
-//
-// LOCAL DEMO ONLY: orders are kept in memory. Restarting the backend loses
-// every record, so the frontend can no longer recover or capture orders created
-// before the restart. Replace this with a persistent database before any
-// deployment.
+
+import type Database from "better-sqlite3";
+import { openDatabase } from "./database.js";
 import type { CaptureResult, ExpectedAmount } from "./paypalCapture.js";
 
 export type PaymentStatus =
-  | "CREATED" // Order created; buyer approval or capture not finished.
-  | "PAID" // Verified COMPLETED capture of the expected amount and currency.
-  | "PENDING" // PayPal holds the capture as PENDING.
-  | "FAILED" // PayPal rejected, declined, or failed the capture.
-  | "NEEDS_REVIEW" // Captured amount or currency does not match; never paid.
-  | "UNKNOWN"; // PayPal's answer was unclear; checking again is safe.
+  | "CREATED"
+  | "PAID"
+  | "PENDING"
+  | "FAILED"
+  | "NEEDS_REVIEW"
+  | "UNKNOWN";
 
 export type OrderRecord = {
   orderID: string;
@@ -28,7 +24,6 @@ export type OrderRecord = {
   message: string | null;
 };
 
-// PayPal order IDs are short alphanumeric strings.
 export function isValidOrderID(value: unknown): value is string {
   return typeof value === "string" && /^[A-Z0-9-]{1,100}$/i.test(value);
 }
@@ -36,22 +31,114 @@ export function isValidOrderID(value: unknown): value is string {
 const UNKNOWN_MESSAGE =
   "Could not confirm the payment status with PayPal. Check again in a moment; this will not charge twice.";
 
-// Statuses that are settled locally and never sent back to PayPal.
 const FINAL_STATUSES = new Set<PaymentStatus>(["PAID", "NEEDS_REVIEW"]);
 
-export class OrderRegistry {
-  private readonly orders = new Map<string, OrderRecord>();
-  private readonly capturesInFlight = new Map<string, Promise<OrderRecord>>();
-  private readonly now: () => Date;
-  private readonly maxOrders: number;
+type RegistryOptions = {
+  now?: () => Date;
+  filename?: string;
+};
 
-  constructor(options: { now?: () => Date; maxOrders?: number } = {}) {
+type OrderRow = {
+  order_id: string;
+  expected_amount: string;
+  expected_currency: string;
+  created_at: string;
+  updated_at: string;
+  payment_status: PaymentStatus;
+  order_status: string | null;
+  capture_status: string | null;
+  captured_amount: string | null;
+  captured_currency: string | null;
+  message: string | null;
+};
+
+export class OrderRegistry {
+  private readonly db: Database.Database;
+  private readonly now: () => Date;
+  private readonly capturesInFlight = new Map<string, Promise<OrderRecord>>();
+
+  private readonly findOrder;
+  private readonly insertOrder;
+  private readonly updateOrder;
+
+  constructor(options: RegistryOptions = {}) {
     this.now = options.now ?? (() => new Date());
-    this.maxOrders = options.maxOrders ?? 500;
+
+    this.db = openDatabase({
+      filename: options.filename ?? ":memory:",
+    });
+
+    this.findOrder = this.db.prepare(`
+      SELECT * FROM paypal_orders WHERE order_id = ?
+    `);
+
+    this.insertOrder = this.db.prepare(`
+      INSERT INTO paypal_orders (
+        order_id,
+        expected_amount,
+        expected_currency,
+        created_at,
+        updated_at,
+        payment_status,
+        order_status,
+        capture_status,
+        captured_amount,
+        captured_currency,
+        message
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(order_id) DO UPDATE SET
+        expected_amount = excluded.expected_amount,
+        expected_currency = excluded.expected_currency,
+        created_at = excluded.created_at,
+        updated_at = excluded.updated_at,
+        payment_status = excluded.payment_status,
+        order_status = excluded.order_status,
+        capture_status = excluded.capture_status,
+        captured_amount = excluded.captured_amount,
+        captured_currency = excluded.captured_currency,
+        message = excluded.message
+    `);
+
+    this.updateOrder = this.db.prepare(`
+      UPDATE paypal_orders SET
+        updated_at = ?,
+        payment_status = ?,
+        order_status = ?,
+        capture_status = ?,
+        captured_amount = ?,
+        captured_currency = ?,
+        message = ?
+      WHERE order_id = ?
+    `);
+  }
+
+  private fromRow(row: OrderRow): OrderRecord {
+    return {
+      orderID: row.order_id,
+      expected: {
+        value: row.expected_amount,
+        currency: row.expected_currency,
+      },
+      createdAt: new Date(row.created_at),
+      updatedAt: new Date(row.updated_at),
+      status: row.payment_status,
+      orderStatus: row.order_status,
+      captureStatus: row.capture_status,
+      capturedAmount: row.captured_amount,
+      capturedCurrency: row.captured_currency,
+      message: row.message,
+    };
   }
 
   register(orderID: string, expected: ExpectedAmount): OrderRecord {
+    const existing = this.get(orderID);
+
+    // Never reset an existing order. In particular, never turn a paid order
+    // back into CREATED through a repeated registration.
+    if (existing) return existing;
+
     const now = this.now();
+
     const record: OrderRecord = {
       orderID,
       expected,
@@ -64,83 +151,125 @@ export class OrderRegistry {
       capturedCurrency: null,
       message: null,
     };
-    this.orders.set(orderID, record);
 
-    // Bound memory use; Map iteration order is insertion order.
-    while (this.orders.size > this.maxOrders) {
-      const oldest = this.orders.keys().next().value;
-      if (oldest === undefined) break;
-      this.orders.delete(oldest);
-    }
+    this.insertOrder.run(
+      record.orderID,
+      record.expected.value,
+      record.expected.currency,
+      record.createdAt.toISOString(),
+      record.updatedAt.toISOString(),
+      record.status,
+      record.orderStatus,
+      record.captureStatus,
+      record.capturedAmount,
+      record.capturedCurrency,
+      record.message,
+    );
+
     return record;
   }
 
   get(orderID: string): OrderRecord | undefined {
-    return this.orders.get(orderID);
+    const row = this.findOrder.get(orderID) as OrderRow | undefined;
+    return row ? this.fromRow(row) : undefined;
   }
 
-  // Capture a registered order and record the verified result. Settled orders
-  // are returned without contacting PayPal, and concurrent requests for the
-  // same order share a single PayPal call. If `runCapture` throws (for example
-  // PayPal authentication failed before any capture was sent), the record is
-  // left unchanged.
   async capture(
     orderID: string,
     runCapture: (expected: ExpectedAmount) => Promise<CaptureResult>,
   ): Promise<OrderRecord | undefined> {
-    const record = this.orders.get(orderID);
+    const record = this.get(orderID);
     if (!record) return undefined;
+
     if (FINAL_STATUSES.has(record.status)) return record;
 
     const inFlight = this.capturesInFlight.get(orderID);
     if (inFlight) return inFlight;
 
     const pending = runCapture(record.expected)
-      .then((result) => this.applyCaptureResult(record, result))
-      .finally(() => this.capturesInFlight.delete(orderID));
+      .then((result) => {
+        this.applyCaptureResult(orderID, result);
+        const updated = this.get(orderID);
+
+        if (!updated) {
+          throw new Error("Order disappeared while recording capture.");
+        }
+
+        return updated;
+      })
+      .finally(() => {
+        this.capturesInFlight.delete(orderID);
+      });
+
     this.capturesInFlight.set(orderID, pending);
     return pending;
   }
 
   private applyCaptureResult(
-    record: OrderRecord,
+    orderID: string,
     result: CaptureResult,
-  ): OrderRecord {
-    record.updatedAt = this.now();
+  ): void {
+    const record = this.get(orderID);
+    if (!record) return;
+
+    const updatedAt = this.now().toISOString();
 
     if (!result.ok) {
-      record.status = result.reason === "STATUS_UNKNOWN" ? "UNKNOWN" : "FAILED";
-      record.message =
+      const status =
+        result.reason === "STATUS_UNKNOWN" ? "UNKNOWN" : "FAILED";
+
+      const message =
         result.reason === "STATUS_UNKNOWN"
           ? UNKNOWN_MESSAGE
           : "PayPal could not capture this order.";
-      return record;
+
+      this.updateOrder.run(
+        updatedAt,
+        status,
+        record.orderStatus,
+        record.captureStatus,
+        record.capturedAmount,
+        record.capturedCurrency,
+        message,
+        orderID,
+      );
+
+      return;
     }
 
     const { outcome } = result;
-    record.orderStatus = outcome.orderStatus;
-    record.captureStatus = outcome.captureStatus;
-    record.capturedAmount = outcome.amount;
-    record.capturedCurrency = outcome.currency;
-    record.message = outcome.message;
+
+    let status: PaymentStatus;
 
     if (outcome.paid) {
-      record.status = "PAID";
+      status = "PAID";
     } else if (outcome.problem === "AMOUNT_MISMATCH") {
-      record.status = "NEEDS_REVIEW";
+      status = "NEEDS_REVIEW";
     } else if (outcome.problem === "NOT_CAPTURED") {
-      record.status = "UNKNOWN";
+      status = "UNKNOWN";
     } else if (outcome.captureStatus === "PENDING") {
-      record.status = "PENDING";
+      status = "PENDING";
     } else {
-      record.status = "FAILED";
+      status = "FAILED";
     }
-    return record;
+
+    this.updateOrder.run(
+      updatedAt,
+      status,
+      outcome.orderStatus,
+      outcome.captureStatus,
+      outcome.amount,
+      outcome.currency,
+      outcome.message,
+      orderID,
+    );
+  }
+
+  close(): void {
+    this.db.close();
   }
 }
 
-// Public view of an order for the frontend. Contains no credentials and no
-// buyer data.
 export function toOrderView(record: OrderRecord) {
   const message =
     record.status === "CREATED"

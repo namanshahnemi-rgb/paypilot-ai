@@ -14,6 +14,9 @@ import { generateProposalDraft } from "./proposalGenerator.js";
 import { analyzeBrief } from "./analysis.js";
 import { ReviewRequestSchema, reviewProposalWithAI } from "./riskReview.js";
 import { jsonErrorHandler } from "./httpErrors.js";
+import { DEFAULT_GEMINI_MODEL, resolveProvider } from "./localModel.js";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 
 dotenv.config();
 
@@ -21,6 +24,8 @@ const app = express();
 const PORT = Number(process.env.PORT) || 4000;
 const OLLAMA_URL = "http://localhost:11434";
 const OLLAMA_MODEL = "qwen2.5:3b";
+const GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta";
+
 
 // Comma-separated list of allowed frontend origins. Vite uses 5173 by default
 // and falls back to 5174 when 5173 is already taken.
@@ -96,7 +101,8 @@ app.get("/api/health", (_req, res) => {
   res.json({
     status: "ok",
     application: "PayPilot AI",
-    aiProvider: "Ollama",
+    // Same AI_PROVIDER rule the proposal routes use; Ollama is the default.
+    aiProvider: resolveProvider({}) === "gemini" ? "Gemini" : "Ollama",
   });
 });
 
@@ -130,8 +136,18 @@ app.get("/api/payments/health", async (_req, res) => {
 const TEST_PAYMENT_AMOUNT = "5.00";
 const PAYMENT_CURRENCY = "USD";
 
-// In-memory for the local demo; see orderRegistry.ts before deploying.
-const orderRegistry = new OrderRegistry();
+const SERVER_DIR = path.resolve(
+  path.dirname(fileURLToPath(import.meta.url)),
+  "..",
+);
+
+const PAYMENT_DB_PATH = process.env.PAYMENT_DB_PATH?.trim()
+  ? path.resolve(process.env.PAYMENT_DB_PATH)
+  : path.join(SERVER_DIR, "data", "paypilot.db");
+
+const orderRegistry = new OrderRegistry({
+  filename: PAYMENT_DB_PATH,
+});
 
 app.post("/api/payments/create-order", async (req, res) => {
   const clientOrigin = getClientOrigin(req);
@@ -248,7 +264,69 @@ app.use(
 );
 
 
+// Checks the Gemini key and model by looking the model up, which generates no
+// content. The key is sent only in the request header; it is never returned
+// or logged.
+async function checkGeminiHealth(res: express.Response) {
+  const provider = "Gemini";
+  const model = process.env.GEMINI_MODEL?.trim() || DEFAULT_GEMINI_MODEL;
+  const apiKey = process.env.GEMINI_API_KEY?.trim();
+
+  if (!apiKey) {
+    return res.status(503).json({
+      status: "error",
+      provider,
+      model,
+      configured: false,
+      message: "GEMINI_API_KEY is not set on the server.",
+    });
+  }
+
+  try {
+    const response = await fetch(
+      `${GEMINI_API_URL}/models/${encodeURIComponent(model)}`,
+      {
+        headers: { "x-goog-api-key": apiKey },
+        signal: AbortSignal.timeout(10000),
+      },
+    );
+
+    if (response.ok) {
+      return res.json({ status: "ok", provider, model, configured: true });
+    }
+
+    const message =
+      response.status === 400 || response.status === 401 || response.status === 403
+        ? "The Gemini API rejected the API key. Check GEMINI_API_KEY."
+        : response.status === 404
+          ? `The Gemini model "${model}" was not found. Check GEMINI_MODEL.`
+          : response.status === 429
+            ? "The Gemini API rate limit or quota was reached. Try again later."
+            : `The Gemini API returned HTTP ${response.status}.`;
+
+    return res.status(502).json({
+      status: "error",
+      provider,
+      model,
+      configured: true,
+      message,
+    });
+  } catch {
+    return res.status(503).json({
+      status: "error",
+      provider,
+      model,
+      configured: true,
+      message: "Cannot connect to the Gemini API.",
+    });
+  }
+}
+
 app.get("/api/ai/health", async (_req, res) => {
+  if (resolveProvider({}) === "gemini") {
+    return checkGeminiHealth(res);
+  }
+
   try {
     const response = await fetch(`${OLLAMA_URL}/api/tags`);
 
@@ -325,8 +403,8 @@ app.post("/api/proposals/draft", async (req, res) => {
   return res.json({ proposal: result.draft });
 });
 
-// AI part of the proposal risk review, using the local model only. It never
-// creates or captures PayPal orders.
+// AI part of the proposal risk review, using the configured AI provider.
+// It never creates or captures PayPal orders.
 app.post("/api/proposals/review", async (req, res) => {
   const parsed = ReviewRequestSchema.safeParse(req.body);
 
@@ -361,6 +439,6 @@ app.use(jsonErrorHandler);
 app.listen(PORT, () => {
   console.log(`PayPilot API running at http://localhost:${PORT}`);
   console.log(
-    "Order registry is in memory: restarting the backend forgets all PayPal orders. Use a database before deploying.",
+    "PayPal order registry: SQLite persistence enabled.",
   );
 });

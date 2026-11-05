@@ -9,6 +9,10 @@ import express from "express";
 import { OrderRegistry, isValidOrderID } from "./orderRegistry.js";
 import { createPaymentRouter, type RunCapture } from "./paymentRoutes.js";
 import { capturePayPalOrder, type ExpectedAmount } from "./paypalCapture.js";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+
 
 const ORDER_ID = "5O190127TN364715T";
 const EXPECTED: ExpectedAmount = { value: "5.00", currency: "USD" };
@@ -114,17 +118,19 @@ test("registering an order records the expected amount, currency, time, and stat
   });
 });
 
-test("the registry keeps at most maxOrders, dropping the oldest", () => {
-  const registry = new OrderRegistry({ maxOrders: 2 });
+test("the registry preserves older unpaid orders", () => {
+  const registry = new OrderRegistry();
+
   registry.register("ORDER1", EXPECTED);
   registry.register("ORDER2", EXPECTED);
   registry.register("ORDER3", EXPECTED);
 
-  assert.equal(registry.get("ORDER1"), undefined);
+  assert.ok(registry.get("ORDER1"));
   assert.ok(registry.get("ORDER2"));
   assert.ok(registry.get("ORDER3"));
-});
 
+  registry.close();
+});
 test("order ID validation accepts PayPal IDs and rejects anything else", () => {
   assert.equal(isValidOrderID(ORDER_ID), true);
   for (const bad of ["", "bad id", "../secret", "A".repeat(101), 42, null]) {
@@ -296,4 +302,29 @@ test("simultaneous capture requests for one order share a single PayPal call", a
     ["PAID", "PAID"],
   );
   assert.equal(paypal.requests(), 1);
+});
+test("registered orders persist after the registry is reopened", () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "paypilot-test-"));
+  const dbPath = path.join(tempDir, "paypilot.db");
+
+  try {
+    const firstRegistry = new OrderRegistry({ filename: dbPath });
+
+    firstRegistry.register("PERSIST-ORDER-1", EXPECTED);
+    firstRegistry.close();
+
+    const secondRegistry = new OrderRegistry({ filename: dbPath });
+
+    const restored = secondRegistry.get("PERSIST-ORDER-1");
+
+    assert.ok(restored);
+    assert.equal(restored.orderID, "PERSIST-ORDER-1");
+    assert.equal(restored.expected.value, "5.00");
+    assert.equal(restored.expected.currency, "USD");
+    assert.equal(restored.status, "CREATED");
+
+    secondRegistry.close();
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
 });

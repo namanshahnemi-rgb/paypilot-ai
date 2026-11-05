@@ -4,6 +4,7 @@ import "./App.css";
 import ProposalEditor from "./ProposalEditor";
 import ProposalRiskReview from "./ProposalRiskReview";
 import { requestJson } from "./api";
+import { AI_PROVIDER_LABELS, fetchAiProvider, type AiProvider } from "./aiProvider";
 import { syncSchedule } from "./riskReview";
 import {
   loadSavedProposal,
@@ -57,7 +58,9 @@ type OrderPaymentStatus = {
   error?: string;
 };
 
-const API_URL = "http://localhost:4000";
+const API_URL = (
+  import.meta.env.VITE_API_URL || "http://localhost:4000"
+).replace(/\/$/, "");
 const PAYMENT_AMOUNT = "5.00";
 const PAYMENT_CURRENCY = "USD";
 
@@ -94,6 +97,19 @@ function App() {
   const [paymentMessage, setPaymentMessage] = useState("");
   const [paymentError, setPaymentError] = useState("");
   const [recheckOrderID, setRecheckOrderID] = useState<string | null>(null);
+  // The backend's configured AI provider; "unknown" until /api/health answers.
+  const [aiProvider, setAiProvider] = useState<AiProvider>("unknown");
+  const providerLabels = AI_PROVIDER_LABELS[aiProvider];
+
+  useEffect(() => {
+    let active = true;
+    void fetchAiProvider(API_URL).then((provider) => {
+      if (active) setAiProvider(provider);
+    });
+    return () => {
+      active = false;
+    };
+  }, []);
 
   async function analyzeBrief() {
     setLoading(true);
@@ -354,7 +370,7 @@ function App() {
           <span className="brand-mark">P</span>
           PayPilot <span className="brand-ai">AI</span>
         </a>
-        <span className="local-badge">LOCAL AI · OLLAMA</span>
+        <span className="local-badge">{providerLabels.badge}</span>
       </header>
 
       <section className="hero">
@@ -447,9 +463,7 @@ function App() {
             {proposalLoading ? "Drafting proposal..." : "Generate proposal draft"}
           </button>
 
-          <p className="privacy-note">
-            Runs through your local Ollama model. No paid AI API required.
-          </p>
+          <p className="privacy-note">{providerLabels.note}</p>
 
           {error && <p className="error-message">{error}</p>}
           {proposalError && <p className="error-message">{proposalError}</p>}
@@ -574,8 +588,7 @@ function App() {
             <div className="spinner" />
             <h2>Drafting your proposal</h2>
             <p>
-              The local model is writing a structured draft. This can take
-              up to a minute.
+              {providerLabels.draftLoading} This can take up to a minute.
             </p>
           </div>
         </section>
@@ -584,7 +597,11 @@ function App() {
       {!proposalLoading && proposal && (
         <>
           <ProposalEditor proposal={proposal} onChange={updateProposal} />
-          <ProposalRiskReview proposal={proposal} apiUrl={API_URL} />
+          <ProposalRiskReview
+            proposal={proposal}
+            apiUrl={API_URL}
+            aiProvider={aiProvider}
+          />
         </>
       )}
     </main>

@@ -1,5 +1,6 @@
 import { useMemo, useState } from "react";
 import { requestJson } from "./api";
+import { AI_PROVIDER_LABELS, type AiProvider } from "./aiProvider";
 import type { EditableProposal } from "./proposal";
 import {
   aiReviewStatus,
@@ -16,6 +17,7 @@ import {
 type ProposalRiskReviewProps = {
   proposal: EditableProposal;
   apiUrl: string;
+  aiProvider: AiProvider; // From GET /api/health; "unknown" names no provider.
 };
 
 const REVIEWED_STORAGE_KEY = "paypilot_reviewed_findings";
@@ -57,7 +59,8 @@ function jumpToSection(sectionId: string) {
   field?.focus({ preventScroll: true });
 }
 
-function ProposalRiskReview({ proposal, apiUrl }: ProposalRiskReviewProps) {
+function ProposalRiskReview({ proposal, apiUrl, aiProvider }: ProposalRiskReviewProps) {
+  const providerLabels = AI_PROVIDER_LABELS[aiProvider];
   const [reviewed, setReviewed] = useState(loadReviewed);
   const [aiReview, setAiReview] = useState<AiReview | null>(loadAiReview);
   const [aiLoading, setAiLoading] = useState(false);
@@ -179,15 +182,13 @@ function ProposalRiskReview({ proposal, apiUrl }: ProposalRiskReviewProps) {
         <div className="label-row">
           <h3>AI review</h3>
           <span className={`tag ${aiStatus === "stale" ? "tag-needs-confirmation" : "tag-suggested"}`}>
-            {aiStatus === "stale" ? "Out of date" : "Local model · recommendations"}
+            {aiStatus === "stale" ? "Out of date" : providerLabels.reviewTag}
           </span>
         </div>
 
         {aiStatus === "none" && (
           <p className="muted">
-            Ask the local model to look for ambiguous wording and commitments
-            the automatic checks can't detect. Nothing is sent outside your
-            computer. This can take up to a minute.
+            {providerLabels.reviewIntro} This can take up to a minute.
           </p>
         )}
         {aiStatus === "stale" && (
@@ -224,7 +225,7 @@ function ProposalRiskReview({ proposal, apiUrl }: ProposalRiskReviewProps) {
           disabled={aiLoading || !canRunAi}
         >
           {aiLoading
-            ? "Reviewing with the local model..."
+            ? providerLabels.reviewLoading
             : aiStatus === "none"
               ? "Run AI review"
               : "Run AI review again"}
