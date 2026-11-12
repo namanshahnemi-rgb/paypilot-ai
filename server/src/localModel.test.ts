@@ -2,7 +2,13 @@
 // are replaced by fake fetch functions, so no live model or network is used.
 import { test, type TestContext } from "node:test";
 import assert from "node:assert/strict";
-import { chatJson, sanitizeApiErrorMessage, type OllamaDeps } from "./localModel.js";
+import {
+  GEMINI_RETRY,
+  chatJson,
+  parseRetryAfterMs,
+  sanitizeApiErrorMessage,
+  type OllamaDeps,
+} from "./localModel.js";
 
 const API_KEY = "AIzaFakeKeyForTests_0123456789abcdefghij";
 const BRIEF =
@@ -249,5 +255,303 @@ test("a body with no error message gives no message", () => {
     { error: "   " },
   ]) {
     assert.equal(sanitizeApiErrorMessage(body, noContext), undefined);
+  }
+});
+// --- Retries for temporary Gemini failures ---------------------------------
+// setTimeout and Date are mocked, so backoff waits take no real time and each
+// request's mocked clock time shows exactly how long the client waited.
+
+const HIGH_DEMAND = {
+  error: {
+    code: 503,
+    status: "UNAVAILABLE",
+    message:
+      "This model is currently experiencing high demand. Spikes in demand are usually temporary. Please try again later.",
+  },
+};
+const GEMINI_OK = {
+  candidates: [{ content: { parts: [{ text: '{"answer":"ok"}' }] }, finishReason: "STOP" }],
+};
+
+type Reply = { status: number; body: unknown; headers?: Record<string, string> };
+
+// A fake fetch that answers with `replies` in order (repeating the last one)
+// and records the mocked clock time of every request.
+function sequence(replies: Reply[]) {
+  const calls: Array<{ at: number; init: RequestInit }> = [];
+  const fetch = async (_url: string, init: RequestInit) => {
+    calls.push({ at: Date.now(), init });
+    const reply = replies[Math.min(calls.length, replies.length) - 1]!;
+    return new Response(JSON.stringify(reply.body), {
+      status: reply.status,
+      headers: reply.headers ?? {},
+    });
+  };
+  const waits = () => calls.slice(1).map((call, i) => call.at - calls[i]!.at);
+  return { fetch, calls, waits };
+}
+
+const nextTurn = () => new Promise((resolve) => setImmediate(resolve));
+
+// Runs `run` to completion with mocked timers: lets pending I/O and promises
+// settle, then fires due timers, until the call is done.
+async function withMockedTimers<T>(t: TestContext, run: () => Promise<T>): Promise<T> {
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: 0 });
+  try {
+    let done = false;
+    const promise = run().finally(() => {
+      done = true;
+    });
+    while (!done) {
+      await nextTurn();
+      t.mock.timers.runAll();
+    }
+    return await promise;
+  } finally {
+    t.mock.timers.reset();
+  }
+}
+
+const BUDGET_MS = 60_000; // The analysis route's budget.
+const runGemini = (t: TestContext, d: OllamaDeps, budget = BUDGET_MS) =>
+  withMockedTimers(t, () => chatJson(d, REQUEST, budget));
+
+for (const status of [503, 429, 502]) {
+  test(`Gemini ${status} followed by success is retried once and succeeds`, async (t) => {
+    const logged = captureWarnings(t);
+    const gemini = sequence([{ status, body: HIGH_DEMAND }, { status: 200, body: GEMINI_OK }]);
+
+    const result = await runGemini(t, deps("gemini", gemini.fetch));
+
+    assert.deepEqual(result, { ok: true, value: { answer: "ok" } });
+    assert.equal(gemini.calls.length, 2);
+    assert.deepEqual(gemini.waits(), [1_000], "the first backoff is 1 s");
+    // The retry sends the very same request.
+    const [first, second] = gemini.calls;
+    assert.equal(second?.init.body, first?.init.body);
+    assert.deepEqual(second?.init.headers, first?.init.headers);
+    assert.equal(second?.init.method, "POST");
+
+    const lines = logged();
+    assert.equal(lines.length, 1, "one line for the failed attempt");
+    assert.match(lines[0] ?? "", /retrying/);
+    assert.match(lines[0] ?? "", new RegExp(`"status":${status}`));
+    assert.match(lines[0] ?? "", /"retry":1,"maxRetries":2,"delayMs":1000/);
+    assertNothingPrivate(lines[0] ?? "");
+  });
+}
+
+for (const status of [400, 401, 403, 404]) {
+  test(`a permanent Gemini ${status} error is not retried`, async (t) => {
+    const logged = captureWarnings(t);
+    const gemini = sequence([
+      { status, body: { error: { message: "Permission denied" } } },
+      { status: 200, body: GEMINI_OK },
+    ]);
+
+    const result = await runGemini(t, deps("gemini", gemini.fetch));
+
+    assert.ok(!result.ok);
+    assert.equal(result.failure, "http-error");
+    assert.equal(result.diagnostic?.status, status);
+    assert.equal(gemini.calls.length, 1);
+    assert.equal(logged().length, 1);
+    assert.doesNotMatch(logged()[0] ?? "", /retrying/);
+  });
+}
+
+test("when every Gemini response is 503 it stops after 2 retries, waiting 1 s then 2 s", async (t) => {
+  const logged = captureWarnings(t);
+  const gemini = sequence([{ status: 503, body: HIGH_DEMAND }]);
+
+  const result = await runGemini(t, deps("gemini", gemini.fetch));
+
+  assert.deepEqual(result, {
+    ok: false,
+    failure: "http-error",
+    diagnostic: { status: 503, message: `UNAVAILABLE: ${HIGH_DEMAND.error.message}` },
+  });
+  assert.equal(gemini.calls.length, 1 + GEMINI_RETRY.maxRetries);
+  assert.deepEqual(gemini.waits(), [1_000, 2_000]);
+
+  const lines = logged();
+  assert.equal(lines.length, 3, "one line per failed attempt");
+  assert.match(lines[0] ?? "", /retrying.*"retry":1/);
+  assert.match(lines[1] ?? "", /retrying.*"retry":2/);
+  assert.match(lines[2] ?? "", /^\["AI model request failed:"/);
+  assert.doesNotMatch(lines[2] ?? "", /retrying/);
+});
+
+test("an Ollama 503 is not retried", async (t) => {
+  const logged = captureWarnings(t);
+  const ollama = sequence([{ status: 503, body: { error: "server busy" } }, { status: 200, body: {} }]);
+
+  const result = await runGemini(t, deps("ollama", ollama.fetch));
+
+  assert.deepEqual(result, {
+    ok: false,
+    failure: "http-error",
+    diagnostic: { status: 503, message: "server busy" },
+  });
+  assert.equal(ollama.calls.length, 1);
+  assert.equal(logged().length, 1);
+});
+
+test("Gemini network failures and timeouts are not retried", async (t) => {
+  captureWarnings(t);
+  const cases: Array<[Error, string]> = [
+    [new TypeError("fetch failed"), "unavailable"],
+    [new DOMException("The operation timed out.", "TimeoutError"), "timeout"],
+  ];
+  for (const [error, failure] of cases) {
+    let calls = 0;
+    const failing = async () => {
+      calls++;
+      throw error;
+    };
+    const result = await chatJson(deps("gemini", failing), REQUEST, BUDGET_MS);
+    assert.deepEqual(result, { ok: false, failure });
+    assert.equal(calls, 1);
+  }
+});
+
+test("a valid Retry-After is honoured, and a long one is capped at 10 s", async (t) => {
+  captureWarnings(t);
+  const cases: Array<[string, number]> = [
+    ["3", 3_000], // Seconds.
+    ["0", 0],
+    ["120", GEMINI_RETRY.maxDelayMs], // Capped.
+    ["Thu, 01 Jan 1970 00:00:05 GMT", 5_000], // HTTP date; the mocked clock starts at 0.
+    ["soon", 1_000], // Invalid: the normal backoff.
+    ["-5", 1_000],
+  ];
+  for (const [retryAfter, expectedWait] of cases) {
+    const gemini = sequence([
+      { status: 429, body: {}, headers: { "Retry-After": retryAfter } },
+      { status: 200, body: GEMINI_OK },
+    ]);
+    const result = await runGemini(t, deps("gemini", gemini.fetch));
+    assert.ok(result.ok, retryAfter);
+    assert.deepEqual(gemini.waits(), [expectedWait], retryAfter);
+  }
+});
+
+test("Retry-After parsing accepts only whole seconds and HTTP dates", () => {
+  assert.equal(parseRetryAfterMs("7", 0), 7_000);
+  assert.equal(parseRetryAfterMs(" 2 ", 0), 2_000);
+  assert.equal(parseRetryAfterMs("Thu, 01 Jan 1970 00:00:01 GMT", 5_000), 0, "a past date means no wait");
+  for (const invalid of [null, undefined, "", "1.5", "-1", "soon", "1e3", "2026-11-12T10:00:00Z"]) {
+    assert.equal(parseRetryAfterMs(invalid, 0), undefined, String(invalid));
+  }
+});
+
+test("a very large Retry-After is valid, never overflows, and the wait is capped at 10 s", async (t) => {
+  // Valid integers of any length parse to a finite, safe number.
+  assert.equal(parseRetryAfterMs("9999999999", 0), 9_999_999_999_000);
+  const huge = "9".repeat(400); // Number(huge) is Infinity.
+  for (const value of ["9999999999", "90071992547409930", huge]) {
+    const ms = parseRetryAfterMs(value, 0);
+    assert.ok(ms !== undefined && Number.isSafeInteger(ms) && ms > GEMINI_RETRY.maxDelayMs, value.slice(0, 20));
+  }
+  assert.equal(parseRetryAfterMs(huge, 0), Number.MAX_SAFE_INTEGER);
+
+  // The retry still happens, after the capped 10 s wait.
+  captureWarnings(t);
+  for (const retryAfter of ["9999999999", huge]) {
+    const gemini = sequence([
+      { status: 503, body: HIGH_DEMAND, headers: { "Retry-After": retryAfter } },
+      { status: 200, body: GEMINI_OK },
+    ]);
+    const result = await runGemini(t, deps("gemini", gemini.fetch));
+    assert.ok(result.ok);
+    assert.deepEqual(gemini.waits(), [GEMINI_RETRY.maxDelayMs]);
+  }
+});
+
+test("retries never exceed the request's timeout budget", async (t) => {
+  captureWarnings(t);
+  // 12 s budget: the first retry (1 s wait, 11 s left) fits; the second
+  // (2 s more would leave under 10 s for the request) does not.
+  const short = sequence([{ status: 503, body: HIGH_DEMAND }]);
+  const result = await runGemini(t, deps("gemini", short.fetch), 12_000);
+  assert.ok(!result.ok);
+  assert.equal(result.diagnostic?.status, 503);
+  assert.equal(short.calls.length, 2);
+
+  // A Retry-After wait that would not leave enough time is not taken.
+  const long = sequence([{ status: 429, body: {}, headers: { "Retry-After": "120" } }]);
+  await runGemini(t, deps("gemini", long.fetch), 15_000);
+  assert.equal(long.calls.length, 1);
+
+  // A budget too small for any retry sends one request.
+  const tiny = sequence([{ status: 503, body: HIGH_DEMAND }]);
+  await runGemini(t, deps("gemini", tiny.fetch), 1_000);
+  assert.equal(tiny.calls.length, 1);
+});
+
+test("a cancelled caller gets no retry", async (t) => {
+  captureWarnings(t);
+  // Cancelled before the request: the request fails and is not retried.
+  const before = new AbortController();
+  before.abort();
+  const first = sequence([{ status: 503, body: HIGH_DEMAND }, { status: 200, body: GEMINI_OK }]);
+  let sawSignal: AbortSignal | undefined;
+  const watching: OllamaDeps["fetch"] = async (url, init) => {
+    sawSignal = init.signal ?? undefined;
+    return first.fetch(url, init);
+  };
+  const result = await runGemini(t, { ...deps("gemini", watching), signal: before.signal });
+  assert.ok(!result.ok);
+  assert.equal(first.calls.length, 1);
+  assert.equal(sawSignal?.aborted, true, "the caller's cancellation reaches the request");
+
+  // Cancelled during the backoff wait: the wait ends and no request follows.
+  const during = new AbortController();
+  const second = sequence([{ status: 503, body: HIGH_DEMAND }, { status: 200, body: GEMINI_OK }]);
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: 0 });
+  try {
+    let done = false;
+    const pending = chatJson({ ...deps("gemini", second.fetch), signal: during.signal }, REQUEST, BUDGET_MS);
+    void pending.finally(() => {
+      done = true;
+    });
+    while (second.calls.length === 0) await nextTurn();
+    for (let i = 0; i < 5; i++) await nextTurn(); // Let it start waiting; no timer fires.
+    assert.equal(done, false, "it is waiting to retry");
+    during.abort();
+    const cancelled = await pending;
+    assert.ok(!cancelled.ok);
+    assert.equal(cancelled.diagnostic?.status, 503);
+    assert.equal(second.calls.length, 1);
+  } finally {
+    t.mock.timers.reset();
+  }
+});
+
+test("retried failures are still sanitized, and no log line has secrets, prompts or bodies", async (t) => {
+  const logged = captureWarnings(t);
+  const leaky = {
+    error: {
+      status: "UNAVAILABLE",
+      message: `Overloaded for key ${API_KEY} while processing ${BRIEF}`,
+    },
+  };
+  const gemini = sequence([{ status: 503, body: leaky }]);
+
+  const result = await runGemini(t, deps("gemini", gemini.fetch));
+
+  assert.ok(!result.ok);
+  assert.equal(gemini.calls.length, 3);
+  assert.deepEqual(result.diagnostic, {
+    status: 503,
+    message: "[message withheld: it quoted the request]",
+  });
+  const lines = logged();
+  assert.equal(lines.length, 3);
+  for (const line of lines) {
+    assertNothingPrivate(line);
+    assert.ok(!line.includes("five-page website"), "the prompt is not logged");
+    assert.ok(!line.includes("generativelanguage"), "the URL is not logged");
+    assert.ok(!line.includes("Overloaded"), "the raw response body is not logged");
   }
 });

@@ -22,6 +22,9 @@ export type OllamaDeps = {
   // Ollama is the default.
   provider?: AiProvider;
   gemini?: GeminiConfig;
+  // Optional: the caller's own cancellation (for example, the client went
+  // away). It aborts the request in flight, and no Gemini retry starts after it.
+  signal?: AbortSignal;
 };
 
 export const DEFAULT_GEMINI_MODEL = "gemini-2.5-flash";
@@ -132,6 +135,7 @@ async function callOllama(
     },
     timeoutMs,
     [request.system, request.user],
+    { retry: false, signal: deps.signal },
   );
   if (!result.ok) return result;
 
@@ -186,6 +190,7 @@ async function callGemini(
     },
     timeoutMs,
     [request.system, request.user],
+    { retry: true, signal: deps.signal },
   );
   if (!result.ok) return result;
 
@@ -210,11 +215,30 @@ function withoutSchemaKeyword(schema: object): object {
   return rest;
 }
 
+// Bounded retries for temporary Gemini failures: rate limiting (429) and
+// server or gateway errors (500, 502, 503 "high demand", 504). Other statuses,
+// network failures and timeouts are never retried, and Ollama never is.
+// All attempts and waits share the caller's single timeout budget.
+export const GEMINI_RETRY = {
+  statuses: new Set([429, 500, 502, 503, 504]),
+  maxRetries: 2, // After the first request, so at most 3 requests.
+  baseDelayMs: 1_000, // Exponential backoff: 1 s, then 2 s.
+  maxDelayMs: 10_000, // Cap for the backoff and for a server's Retry-After.
+  // A retry starts only if, after its wait, at least this much of the budget
+  // is left for the new request; otherwise the last error is returned.
+  minAttemptMs: 10_000,
+};
+
+type RetryOptions = { retry: boolean; signal?: AbortSignal | undefined };
+type PostResult = { ok: true; data: unknown } | Failed;
+
 // POSTs a JSON body and returns the parsed JSON reply, or why there is none.
-// Never throws. On an error status it logs one line with the provider, the
-// status, and the API's sanitized error message; it never logs the request,
-// the headers, or the response. `headers` are secrets (they are redacted from
-// that message), and so is `privateText`, the prompts sent in `body`.
+// Never throws. On each error status it logs one line with the provider, the
+// status, and the API's sanitized error message (plus the retry number and
+// wait when it retries); it never logs the request, the headers, or the
+// response. `headers` are secrets (they are redacted from that message), and
+// so is `privateText`, the prompts sent in `body`. `timeoutMs` is the budget
+// for every attempt and wait together.
 async function postJson(
   provider: AiProvider,
   fetch: FetchLike,
@@ -223,13 +247,60 @@ async function postJson(
   body: unknown,
   timeoutMs: number,
   privateText: string[],
-): Promise<{ ok: true; data: unknown } | Failed> {
+  { retry, signal }: RetryOptions,
+): Promise<PostResult> {
+  const deadline = Date.now() + timeoutMs;
+  const payload = JSON.stringify(body);
+
+  for (let retries = 0; ; retries++) {
+    const remainingMs = retries === 0 ? timeoutMs : deadline - Date.now();
+    const attempt = await postOnce(fetch, url, headers, payload, remainingMs, privateText, signal);
+    const { result } = attempt;
+    if (result.ok || result.failure !== "http-error") return result;
+
+    const status = result.diagnostic?.status ?? 0;
+    const delayMs = retryDelayMs(retries + 1, attempt.retryAfter, Date.now());
+    const willRetry =
+      retry &&
+      GEMINI_RETRY.statuses.has(status) &&
+      retries < GEMINI_RETRY.maxRetries &&
+      !signal?.aborted &&
+      Date.now() + delayMs + GEMINI_RETRY.minAttemptMs <= deadline;
+
+    if (!willRetry) {
+      console.warn("AI model request failed:", { provider, ...result.diagnostic });
+      return result;
+    }
+    console.warn("AI model request failed; retrying:", {
+      provider,
+      ...result.diagnostic,
+      retry: retries + 1,
+      maxRetries: GEMINI_RETRY.maxRetries,
+      delayMs,
+    });
+    await wait(delayMs, signal);
+    if (signal?.aborted) return result;
+  }
+}
+
+// One request. Reports the Retry-After header of an error response so the
+// retry loop can honour it; nothing else from the response leaves here.
+async function postOnce(
+  fetch: FetchLike,
+  url: string,
+  headers: Record<string, string>,
+  payload: string,
+  timeoutMs: number,
+  privateText: string[],
+  callerSignal: AbortSignal | undefined,
+): Promise<{ result: PostResult; retryAfter?: string | null }> {
+  const timeout = AbortSignal.timeout(Math.max(1, timeoutMs));
   try {
     const response = await fetch(url, {
       method: "POST",
       headers: { "Content-Type": "application/json", ...headers },
-      body: JSON.stringify(body),
-      signal: AbortSignal.timeout(timeoutMs),
+      body: payload,
+      signal: callerSignal ? AbortSignal.any([timeout, callerSignal]) : timeout,
     });
 
     if (!response.ok) {
@@ -239,20 +310,65 @@ async function postJson(
         privateText,
       });
       if (message) diagnostic.message = message;
-      console.warn("AI model request failed:", { provider, ...diagnostic });
-      return { ok: false, failure: "http-error", diagnostic };
+      return {
+        result: { ok: false, failure: "http-error", diagnostic },
+        retryAfter: response.headers.get("retry-after"),
+      };
     }
 
-    return { ok: true, data: (await response.json()) as unknown };
+    return { result: { ok: true, data: (await response.json()) as unknown } };
   } catch (error) {
     return {
-      ok: false,
-      failure:
-        error instanceof Error && error.name === "TimeoutError"
-          ? "timeout"
-          : "unavailable",
+      result: {
+        ok: false,
+        failure:
+          error instanceof Error && error.name === "TimeoutError"
+            ? "timeout"
+            : "unavailable",
+      },
     };
   }
+}
+
+// The wait before retry number `retry` (1-based): the server's Retry-After
+// when it is valid, otherwise exponential backoff; capped either way.
+function retryDelayMs(retry: number, retryAfter: string | null | undefined, now: number): number {
+  const requested = parseRetryAfterMs(retryAfter, now);
+  const delay = requested ?? GEMINI_RETRY.baseDelayMs * 2 ** (retry - 1);
+  return Math.min(delay, GEMINI_RETRY.maxDelayMs);
+}
+
+// IMF-fixdate, the HTTP date format, e.g. "Wed, 21 Oct 2026 07:28:00 GMT".
+const HTTP_DATE = /^[A-Z][a-z]{2}, \d{2} [A-Z][a-z]{2} \d{4} \d{2}:\d{2}:\d{2} GMT$/;
+
+// A Retry-After value in milliseconds: whole seconds, or an HTTP date
+// (a date in the past means no wait). Anything else is not valid. Any number
+// of digits is valid; a value too large to represent exactly becomes
+// Number.MAX_SAFE_INTEGER (never Infinity or NaN), and retryDelayMs caps it.
+export function parseRetryAfterMs(value: string | null | undefined, now: number): number | undefined {
+  const text = value?.trim();
+  if (!text) return undefined;
+  if (/^\d+$/.test(text)) {
+    const ms = Number(text) * 1000;
+    return Number.isSafeInteger(ms) ? ms : Number.MAX_SAFE_INTEGER;
+  }
+  if (!HTTP_DATE.test(text)) return undefined;
+  const date = Date.parse(text);
+  return Number.isNaN(date) ? undefined : Math.max(0, date - now);
+}
+
+// Resolves after `ms`, or as soon as `signal` aborts.
+function wait(ms: number, signal: AbortSignal | undefined): Promise<void> {
+  return new Promise((resolve) => {
+    if (signal?.aborted) return resolve();
+    const done = () => {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", done);
+      resolve();
+    };
+    const timer = setTimeout(done, ms);
+    signal?.addEventListener("abort", done, { once: true });
+  });
 }
 
 // The parsed JSON body of an error response, or undefined if it is missing,
