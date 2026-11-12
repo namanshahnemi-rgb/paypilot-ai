@@ -108,7 +108,7 @@ pipeline {
     string(name: 'GHCR_IMAGE', defaultValue: 'ghcr.io/namanshahnemi-rgb/paypilot-api',
       description: 'Image name to publish (lowercase).')
     string(name: 'PRODUCTION_API_URL', defaultValue: 'https://paypilot-api-latest.onrender.com',
-      description: 'Checked with read-only GET requests after a deploy.')
+      description: 'The backend URL built into the frontend bundle (VITE_API_URL), and checked with read-only GET requests after a deploy.')
     string(name: 'PRODUCTION_FRONTEND_ORIGIN', defaultValue: 'https://rapid-fire-08f4.namanshahnemi.workers.dev',
       description: 'The frontend origin the production API must allow (CORS check after a deploy).')
   }
@@ -193,7 +193,13 @@ pipeline {
       steps {
         script {
           runNpm('server', 'run build', 'TypeScript compilation failed. Reproduce with npm run build in server/.')
-          runNpm('client', 'run build', 'The type check (tsc -b) or the Vite production build failed. Reproduce with npm run build in client/.')
+          // The frontend bundle embeds the backend URL at build time, and
+          // client/.env.production is not in Git, so the URL comes from the
+          // PRODUCTION_API_URL parameter, for this one command only. The Vite
+          // config refuses a missing, non-https, or localhost value.
+          withEnv(["VITE_API_URL=${(params.PRODUCTION_API_URL ?: '').trim()}"]) {
+            runNpm('client', 'run build', 'The type check (tsc -b) or the Vite production build failed. If the message is about VITE_API_URL, set the PRODUCTION_API_URL parameter to the https URL of the backend. Reproduce with npm run build in client/.')
+          }
         }
       }
     }
