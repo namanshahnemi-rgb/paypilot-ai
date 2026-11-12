@@ -22,6 +22,7 @@ import {
 } from "./projects";
 import { accessProblem } from "./account";
 import { requestJson } from "./api";
+import { resolveApiUrl } from "./apiConfig";
 import {
   CHECKOUT_TOKEN_HEADER,
   forgetCheckout,
@@ -75,9 +76,12 @@ type OrderPaymentStatus = {
   error?: string;
 };
 
-const API_URL = (
-  import.meta.env.VITE_API_URL || "http://localhost:4000"
-).replace(/\/$/, "");
+// The only place the API base URL is decided; every request below uses it.
+// The local fallback exists only in development builds.
+const API_URL = resolveApiUrl(
+  import.meta.env.VITE_API_URL,
+  import.meta.env.DEV ? "http://localhost:4000" : undefined,
+);
 
 type View = "dashboard" | "workspace" | "billing";
 const PROJECT_STORAGE_KEY = "paypilot_project_id";
