@@ -4,9 +4,11 @@
 import { z } from "zod";
 import {
   chatJson,
+  failureFor,
   parseFields,
   RETRYABLE_FAILURES,
   type ChatJsonFailure,
+  type FailureResponse,
   type OllamaDeps,
 } from "./localModel.js";
 import { amountsInText, currenciesInText } from "./proposal.js";
@@ -200,12 +202,12 @@ const ATTEMPT_OPTIONS = [
   { temperature: 0.2, num_predict: 1600, num_ctx: 8192 },
 ];
 
-const FAILURES: Record<ChatJsonFailure | "unusable", { status: number; error: string }> = {
-  "http-error": { status: 502, error: "Ollama request failed." },
+const FAILURES: Record<ChatJsonFailure | "unusable", FailureResponse> = {
+  "http-error": { status: 502, error: "The AI service could not analyze the brief. Try again." },
   timeout: { status: 504, error: "AI analysis timed out. Try a shorter brief." },
   unavailable: {
     status: 503,
-    error: "Cannot reach the local AI model. Check that Ollama is running.",
+    error: "The AI service is not available right now. Try again later.",
   },
   empty: { status: 502, error: "The AI returned an empty response. Please retry." },
   truncated: {
@@ -216,6 +218,15 @@ const FAILURES: Record<ChatJsonFailure | "unusable", { status: number; error: st
   unusable: {
     status: 502,
     error: "The AI response did not match the required schema. Please retry.",
+  },
+};
+
+// Ollama runs on this computer, so its failures can name the local fix.
+const OLLAMA_FAILURES: Partial<typeof FAILURES> = {
+  "http-error": { status: 502, error: "Ollama request failed." },
+  unavailable: {
+    status: 503,
+    error: "Cannot reach the local AI model. Check that Ollama is running.",
   },
 };
 
@@ -248,10 +259,10 @@ export async function analyzeBrief(
       failure = result.failure;
       // Timeouts and connection or server errors aren't model-output problems.
       if (!RETRYABLE_FAILURES.has(result.failure)) {
-        return { ok: false, attempts, ...FAILURES[failure] };
+        return { ok: false, attempts, ...failureFor(deps, failure, FAILURES, OLLAMA_FAILURES) };
       }
     }
   }
 
-  return { ok: false, attempts: ATTEMPT_OPTIONS.length, ...FAILURES[failure] };
+  return { ok: false, attempts: ATTEMPT_OPTIONS.length, ...failureFor(deps, failure, FAILURES, OLLAMA_FAILURES) };
 }

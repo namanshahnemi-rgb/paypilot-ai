@@ -1,5 +1,6 @@
 import { useMemo, useState } from "react";
 import { requestJson } from "./api";
+import { accessProblem } from "./account";
 import { AI_PROVIDER_LABELS, type AiProvider } from "./aiProvider";
 import type { EditableProposal } from "./proposal";
 import {
@@ -18,6 +19,11 @@ type ProposalRiskReviewProps = {
   proposal: EditableProposal;
   apiUrl: string;
   aiProvider: AiProvider; // From GET /api/health; "unknown" names no provider.
+  // For a saved project: the review stored with it (null if none). When
+  // omitted, the review saved in this browser tab is used.
+  savedReview?: AiReview | null;
+  // Called with each completed AI review, so a project can save it.
+  onAiReview?: (review: AiReview) => void;
 };
 
 const REVIEWED_STORAGE_KEY = "paypilot_reviewed_findings";
@@ -59,10 +65,12 @@ function jumpToSection(sectionId: string) {
   field?.focus({ preventScroll: true });
 }
 
-function ProposalRiskReview({ proposal, apiUrl, aiProvider }: ProposalRiskReviewProps) {
+function ProposalRiskReview({ proposal, apiUrl, aiProvider, savedReview, onAiReview }: ProposalRiskReviewProps) {
   const providerLabels = AI_PROVIDER_LABELS[aiProvider];
   const [reviewed, setReviewed] = useState(loadReviewed);
-  const [aiReview, setAiReview] = useState<AiReview | null>(loadAiReview);
+  const [aiReview, setAiReview] = useState<AiReview | null>(() =>
+    savedReview === undefined ? loadAiReview() : savedReview,
+  );
   const [aiLoading, setAiLoading] = useState(false);
   const [aiError, setAiError] = useState("");
 
@@ -109,7 +117,7 @@ function ProposalRiskReview({ proposal, apiUrl, aiProvider }: ProposalRiskReview
       );
 
       if (!response.ok || !Array.isArray(data.findings)) {
-        throw new Error(data.error ?? "The AI review failed.");
+        throw new Error(accessProblem(response.status, data) ?? data.error ?? "The AI review failed.");
       }
 
       const review: AiReview = {
@@ -119,6 +127,7 @@ function ProposalRiskReview({ proposal, apiUrl, aiProvider }: ProposalRiskReview
       };
       setAiReview(review);
       save(AI_REVIEW_STORAGE_KEY, review);
+      onAiReview?.(review);
     } catch (err) {
       setAiError(err instanceof Error ? err.message : "Could not connect to the backend.");
     } finally {
@@ -144,7 +153,7 @@ function ProposalRiskReview({ proposal, apiUrl, aiProvider }: ProposalRiskReview
       <div className="report risk-review">
         <div className="report-heading">
           <div>
-            <p className="eyebrow">BEFORE YOU SHARE</p>
+            <p className="eyebrow">STEP 04 · RISK REVIEW</p>
             <h2 id="risk-review-heading">Proposal risk review</h2>
           </div>
           <span className="status-pill">Updates as you edit</span>

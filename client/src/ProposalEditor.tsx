@@ -85,7 +85,7 @@ function ProposalEditor({ proposal, onChange }: ProposalEditorProps) {
       <div className="report proposal-editor">
         <div className="report-heading">
           <div>
-            <p className="eyebrow">STEP 02</p>
+            <p className="eyebrow">STEP 03 · PROPOSAL</p>
             <h2 id="proposal-heading">Proposal draft</h2>
           </div>
           <span className="status-pill">Draft · not sent</span>

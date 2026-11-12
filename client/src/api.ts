@@ -11,7 +11,9 @@ export async function requestJson<T>(
 ): Promise<{ response: Response; data: T & { error?: string } }> {
   let response: Response;
   try {
-    response = await fetch(url, init);
+    // Sends the HttpOnly session cookie to the API, which is on another
+    // origin. The backend only allows this for the origins in CLIENT_ORIGINS.
+    response = await fetch(url, { credentials: "include", ...init });
   } catch {
     throw new Error(SERVER_UNREACHABLE);
   }

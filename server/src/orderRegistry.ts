@@ -1,37 +1,26 @@
-
+// SQLite order registry, used by the unit tests (in memory). The backend
+// uses the PostgreSQL registry in postgresOrderRegistry.ts; both implement
+// OrderRegistryPort from orderModel.ts and record capture results the same
+// way (captureUpdate).
 import type Database from "better-sqlite3";
 import { openDatabase } from "./database.js";
 import type { CaptureResult, ExpectedAmount } from "./paypalCapture.js";
+import {
+  FINAL_STATUSES,
+  captureUpdate,
+  type OrderRecord,
+  type OrderRegistryPort,
+  type PaymentStatus,
+} from "./orderModel.js";
 
-export type PaymentStatus =
-  | "CREATED"
-  | "PAID"
-  | "PENDING"
-  | "FAILED"
-  | "NEEDS_REVIEW"
-  | "UNKNOWN";
-
-export type OrderRecord = {
-  orderID: string;
-  expected: ExpectedAmount;
-  createdAt: Date;
-  updatedAt: Date;
-  status: PaymentStatus;
-  orderStatus: string | null;
-  captureStatus: string | null;
-  capturedAmount: string | null;
-  capturedCurrency: string | null;
-  message: string | null;
-};
-
-export function isValidOrderID(value: unknown): value is string {
-  return typeof value === "string" && /^[A-Z0-9-]{1,100}$/i.test(value);
-}
-
-const UNKNOWN_MESSAGE =
-  "Could not confirm the payment status with PayPal. Check again in a moment; this will not charge twice.";
-
-const FINAL_STATUSES = new Set<PaymentStatus>(["PAID", "NEEDS_REVIEW"]);
+// Re-exported so existing imports from this module keep working.
+export {
+  isValidOrderID,
+  toOrderView,
+  type OrderRecord,
+  type OrderRegistryPort,
+  type PaymentStatus,
+} from "./orderModel.js";
 
 type RegistryOptions = {
   now?: () => Date;
@@ -50,12 +39,16 @@ type OrderRow = {
   captured_amount: string | null;
   captured_currency: string | null;
   message: string | null;
+  checkout_token_hash: string | null;
 };
 
-export class OrderRegistry {
+export class OrderRegistry implements OrderRegistryPort {
   private readonly db: Database.Database;
   private readonly now: () => Date;
-  private readonly capturesInFlight = new Map<string, Promise<OrderRecord>>();
+  private readonly capturesInFlight = new Map<
+    string,
+    Promise<OrderRecord | undefined>
+  >();
 
   private readonly findOrder;
   private readonly insertOrder;
@@ -73,7 +66,7 @@ export class OrderRegistry {
     `);
 
     this.insertOrder = this.db.prepare(`
-      INSERT INTO paypal_orders (
+      INSERT OR IGNORE INTO paypal_orders (
         order_id,
         expected_amount,
         expected_currency,
@@ -84,19 +77,9 @@ export class OrderRegistry {
         capture_status,
         captured_amount,
         captured_currency,
-        message
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      ON CONFLICT(order_id) DO UPDATE SET
-        expected_amount = excluded.expected_amount,
-        expected_currency = excluded.expected_currency,
-        created_at = excluded.created_at,
-        updated_at = excluded.updated_at,
-        payment_status = excluded.payment_status,
-        order_status = excluded.order_status,
-        capture_status = excluded.capture_status,
-        captured_amount = excluded.captured_amount,
-        captured_currency = excluded.captured_currency,
-        message = excluded.message
+        message,
+        checkout_token_hash
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
 
     this.updateOrder = this.db.prepare(`
@@ -127,49 +110,44 @@ export class OrderRegistry {
       capturedAmount: row.captured_amount,
       capturedCurrency: row.captured_currency,
       message: row.message,
+      checkoutTokenHash: row.checkout_token_hash,
     };
   }
 
-  register(orderID: string, expected: ExpectedAmount): OrderRecord {
-    const existing = this.get(orderID);
-
-    // Never reset an existing order. In particular, never turn a paid order
-    // back into CREATED through a repeated registration.
-    if (existing) return existing;
-
+  // Registering an order that already exists changes nothing, including its
+  // checkout token hash.
+  async register(
+    orderID: string,
+    expected: ExpectedAmount,
+    checkoutTokenHash: string | null = null,
+  ): Promise<OrderRecord> {
     const now = this.now();
 
-    const record: OrderRecord = {
-      orderID,
-      expected,
-      createdAt: now,
-      updatedAt: now,
-      status: "CREATED",
-      orderStatus: null,
-      captureStatus: null,
-      capturedAmount: null,
-      capturedCurrency: null,
-      message: null,
-    };
-
     this.insertOrder.run(
-      record.orderID,
-      record.expected.value,
-      record.expected.currency,
-      record.createdAt.toISOString(),
-      record.updatedAt.toISOString(),
-      record.status,
-      record.orderStatus,
-      record.captureStatus,
-      record.capturedAmount,
-      record.capturedCurrency,
-      record.message,
+      orderID,
+      expected.value,
+      expected.currency,
+      now.toISOString(),
+      now.toISOString(),
+      "CREATED",
+      null,
+      null,
+      null,
+      null,
+      null,
+      checkoutTokenHash,
     );
+
+    const record = await this.get(orderID);
+
+    if (!record) {
+      throw new Error("Order registration could not be confirmed.");
+    }
 
     return record;
   }
 
-  get(orderID: string): OrderRecord | undefined {
+  async get(orderID: string): Promise<OrderRecord | undefined> {
     const row = this.findOrder.get(orderID) as OrderRow | undefined;
     return row ? this.fromRow(row) : undefined;
   }
@@ -178,116 +156,50 @@ export class OrderRegistry {
     orderID: string,
     runCapture: (expected: ExpectedAmount) => Promise<CaptureResult>,
   ): Promise<OrderRecord | undefined> {
-    const record = this.get(orderID);
-    if (!record) return undefined;
+    const existing = this.capturesInFlight.get(orderID);
+    if (existing) return existing;
 
-    if (FINAL_STATUSES.has(record.status)) return record;
-
-    const inFlight = this.capturesInFlight.get(orderID);
-    if (inFlight) return inFlight;
-
-    const pending = runCapture(record.expected)
-      .then((result) => {
-        this.applyCaptureResult(orderID, result);
-        const updated = this.get(orderID);
-
-        if (!updated) {
-          throw new Error("Order disappeared while recording capture.");
-        }
-
-        return updated;
-      })
-      .finally(() => {
-        this.capturesInFlight.delete(orderID);
-      });
+    const pending = this.captureOnce(orderID, runCapture).finally(() => {
+      this.capturesInFlight.delete(orderID);
+    });
 
     this.capturesInFlight.set(orderID, pending);
     return pending;
   }
 
-  private applyCaptureResult(
+  private async captureOnce(
     orderID: string,
-    result: CaptureResult,
-  ): void {
-    const record = this.get(orderID);
-    if (!record) return;
+    runCapture: (expected: ExpectedAmount) => Promise<CaptureResult>,
+  ): Promise<OrderRecord | undefined> {
+    const record = await this.get(orderID);
+    if (!record) return undefined;
 
-    const updatedAt = this.now().toISOString();
+    if (FINAL_STATUSES.has(record.status)) return record;
 
-    if (!result.ok) {
-      const status =
-        result.reason === "STATUS_UNKNOWN" ? "UNKNOWN" : "FAILED";
-
-      const message =
-        result.reason === "STATUS_UNKNOWN"
-          ? UNKNOWN_MESSAGE
-          : "PayPal could not capture this order.";
-
-      this.updateOrder.run(
-        updatedAt,
-        status,
-        record.orderStatus,
-        record.captureStatus,
-        record.capturedAmount,
-        record.capturedCurrency,
-        message,
-        orderID,
-      );
-
-      return;
-    }
-
-    const { outcome } = result;
-
-    let status: PaymentStatus;
-
-    if (outcome.paid) {
-      status = "PAID";
-    } else if (outcome.problem === "AMOUNT_MISMATCH") {
-      status = "NEEDS_REVIEW";
-    } else if (outcome.problem === "NOT_CAPTURED") {
-      status = "UNKNOWN";
-    } else if (outcome.captureStatus === "PENDING") {
-      status = "PENDING";
-    } else {
-      status = "FAILED";
-    }
+    const result = await runCapture(record.expected);
+    const update = captureUpdate(result, record);
 
     this.updateOrder.run(
-      updatedAt,
-      status,
-      outcome.orderStatus,
-      outcome.captureStatus,
-      outcome.amount,
-      outcome.currency,
-      outcome.message,
+      this.now().toISOString(),
+      update.status,
+      update.orderStatus,
+      update.captureStatus,
+      update.amount,
+      update.currency,
+      update.message,
       orderID,
     );
+
+    const updated = await this.get(orderID);
+
+    if (!updated) {
+      throw new Error("Order disappeared while recording capture.");
+    }
+
+    return updated;
   }
 
   close(): void {
     this.db.close();
   }
-}
-
-export function toOrderView(record: OrderRecord) {
-  const message =
-    record.status === "CREATED"
-      ? "Checkout has not been completed for this order."
-      : record.message;
-
-  return {
-    orderID: record.orderID,
-    paymentStatus: record.status,
-    paid: record.status === "PAID",
-    expectedAmount: record.expected.value,
-    expectedCurrency: record.expected.currency,
-    orderStatus: record.orderStatus,
-    captureStatus: record.captureStatus,
-    amount: record.capturedAmount,
-    currency: record.capturedCurrency,
-    createdAt: record.createdAt.toISOString(),
-    updatedAt: record.updatedAt.toISOString(),
-    ...(message ? { message } : {}),
-  };
 }

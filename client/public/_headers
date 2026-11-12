@@ -1,0 +1,19 @@
+# Security headers for the frontend on Cloudflare Workers static assets (PP-17).
+# Vite copies this file into dist/, and Cloudflare applies it to every static
+# asset response on the next frontend deploy. Local development (npm run dev,
+# vite preview) does not use it.
+#
+# Content-Security-Policy, by directive:
+# - script-src 'self': only the bundled script; no inline scripts or eval.
+# - style-src / font-src: the bundled CSS plus Google Fonts (App.css imports it).
+# - connect-src: this site and the backend API. If VITE_API_URL changes, change
+#   the API origin here too, or every API call is blocked.
+# - frame-ancestors 'none': the site cannot be framed (clickjacking).
+# PayPal checkout is a top-level redirect, so it needs no CSP entry.
+/*
+  Content-Security-Policy: default-src 'self'; script-src 'self'; style-src 'self' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; img-src 'self' data:; connect-src 'self' https://paypilot-api-latest.onrender.com; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'
+  X-Frame-Options: DENY
+  X-Content-Type-Options: nosniff
+  Referrer-Policy: strict-origin-when-cross-origin
+  Permissions-Policy: camera=(), microphone=(), geolocation=(), payment=()
+  Strict-Transport-Security: max-age=31536000

@@ -69,6 +69,23 @@ export function resolveProvider(deps: Pick<OllamaDeps, "provider">): AiProvider 
     : "ollama";
 }
 
+// What an AI route answers when the model call fails.
+export type FailureResponse = { status: number; error: string };
+
+// Picks the user-facing failure for the provider that handled the request.
+// `messages` is worded for any provider; `ollamaMessages` replaces entries
+// whose fix is local (such as starting Ollama), and is used only in Ollama
+// mode, so Gemini users never see local-model instructions.
+export function failureFor<K extends string>(
+  deps: Pick<OllamaDeps, "provider">,
+  failure: K,
+  messages: Record<K, FailureResponse>,
+  ollamaMessages: Partial<Record<K, FailureResponse>>,
+): FailureResponse {
+  const local = resolveProvider(deps) === "ollama" ? ollamaMessages[failure] : undefined;
+  return local ?? messages[failure];
+}
+
 // One non-streaming chat request whose output the model constrains to
 // `format` (a JSON schema). Never throws.
 export async function chatJson(

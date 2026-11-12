@@ -1,11 +1,36 @@
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import "./App.css";
 import ProposalEditor from "./ProposalEditor";
 import ProposalRiskReview from "./ProposalRiskReview";
+import AccountPanel from "./AccountPanel";
+import Dashboard from "./Dashboard";
+import {
+  ApiError,
+  PROJECT_STATUS_LABELS,
+  PROPOSAL_STATUS_LABELS,
+  describeUsage,
+  fetchUsage,
+  formatBudget,
+  getProject,
+  saveProjectDocument,
+  updateProject,
+  type ProjectDetail,
+  type ProjectStatus,
+  type ProposalStatus,
+  type Usage,
+} from "./projects";
+import { accessProblem } from "./account";
 import { requestJson } from "./api";
+import {
+  CHECKOUT_TOKEN_HEADER,
+  forgetCheckout,
+  isConfirmedPayment,
+  readPaymentReturn,
+  readSavedCheckout,
+} from "./paymentFlow";
 import { AI_PROVIDER_LABELS, fetchAiProvider, type AiProvider } from "./aiProvider";
-import { syncSchedule } from "./riskReview";
+import { syncSchedule, type AiReview } from "./riskReview";
 import {
   loadSavedProposal,
   toEditableProposal,
@@ -31,14 +56,6 @@ type Analysis = {
   client_questions: string[];
 };
 
-type PayPalOrder = {
-  orderID?: string;
-  amount?: string;
-  currency?: string;
-  approveUrl?: string;
-  error?: string;
-};
-
 // Order status as verified and recorded by the backend.
 type OrderPaymentStatus = {
   orderID?: string;
@@ -61,8 +78,32 @@ type OrderPaymentStatus = {
 const API_URL = (
   import.meta.env.VITE_API_URL || "http://localhost:4000"
 ).replace(/\/$/, "");
-const PAYMENT_AMOUNT = "5.00";
-const PAYMENT_CURRENCY = "USD";
+
+type View = "dashboard" | "workspace" | "billing";
+const PROJECT_STORAGE_KEY = "paypilot_project_id";
+
+// A saved analysis is shown only if it has the shape this page renders.
+function isAnalysis(value: unknown): value is Analysis {
+  const a = value as Partial<Analysis> | null;
+  return Boolean(
+    a &&
+      Array.isArray(a.deliverables) &&
+      Array.isArray(a.missing_terms) &&
+      Array.isArray(a.risk_findings) &&
+      Array.isArray(a.client_questions) &&
+      a.budget &&
+      typeof a.budget === "object",
+  );
+}
+
+function remember(key: string, value: unknown) {
+  try {
+    if (value === null) sessionStorage.removeItem(key);
+    else sessionStorage.setItem(key, typeof value === "string" ? value : JSON.stringify(value));
+  } catch {
+    // Storage unavailable: the page still works for this view.
+  }
+}
 
 const exampleBrief =
   "A client wants a five-page business website with a contact form, mobile responsiveness, delivery in two weeks, two rounds of revisions, and a budget of $800.";
@@ -97,9 +138,193 @@ function App() {
   const [paymentMessage, setPaymentMessage] = useState("");
   const [paymentError, setPaymentError] = useState("");
   const [recheckOrderID, setRecheckOrderID] = useState<string | null>(null);
+  // Blocks a second checkout or capture request while one is running, even
+  // before React re-renders the disabled button (for example, a fast double
+  // click).
+  const paymentRequestActive = useRef(false);
   // The backend's configured AI provider; "unknown" until /api/health answers.
   const [aiProvider, setAiProvider] = useState<AiProvider>("unknown");
   const providerLabels = AI_PROVIDER_LABELS[aiProvider];
+  // Bumped when the server refuses an AI request for access reasons (signed
+  // out, no active subscription), so the account panel reloads its state.
+  const [accountRefresh, setAccountRefresh] = useState(0);
+
+  // SaaS shell: the current view, the open project (if any) and plan usage.
+  // Returning from a PayPal subscription approval opens the billing page,
+  // where the account panel confirms the subscription with the server.
+  const [view, setView] = useState<View>(() =>
+    new URLSearchParams(window.location.search).has("subscription") ? "billing" : "dashboard",
+  );
+  const [project, setProject] = useState<ProjectDetail | null>(null);
+  const [projectNotice, setProjectNotice] = useState("");
+  const [projectError, setProjectError] = useState("");
+  const [projectSaving, setProjectSaving] = useState(false);
+  const [proposalDirty, setProposalDirty] = useState(false);
+  // Opens the dashboard with the new-project form already showing.
+  const [dashboardForm, setDashboardForm] = useState(false);
+  const [usage, setUsage] = useState<Usage | null>(null);
+  // Bumped after anything that can change usage, the plan or the project list.
+  const [dataRefresh, setDataRefresh] = useState(0);
+  const refreshData = () => setDataRefresh((value) => value + 1);
+
+  useEffect(() => {
+    let active = true;
+    fetchUsage(API_URL)
+      .then((next) => {
+        if (active) setUsage(next);
+      })
+      .catch(() => {
+        if (active) setUsage(null);
+      });
+    return () => {
+      active = false;
+    };
+  }, [dataRefresh, accountRefresh]);
+
+  function adoptProject(next: ProjectDetail) {
+    setProject(next);
+    remember(PROJECT_STORAGE_KEY, next.id);
+  }
+
+  function closeProject() {
+    setProject(null);
+    setProposalDirty(false);
+    setProjectNotice("");
+    setProjectError("");
+    remember(PROJECT_STORAGE_KEY, null);
+    setBrief("");
+    setAnalysis(null);
+    setProposal(null);
+    remember("paypilot_brief", null);
+    remember("paypilot_analysis", null);
+    remember("paypilot_proposal", null);
+    setView("dashboard");
+  }
+
+  // Saves an edited brief without running the AI.
+  async function saveBrief() {
+    await saveToProject((target) => saveBriefIfChanged(target), "Brief saved.");
+  }
+
+  // Loads a saved project into the workspace: its brief, analysis, proposal
+  // and saved risk review.
+  async function openProject(id: string, options: { show?: boolean } = {}) {
+    setProjectError("");
+    setProjectNotice("");
+    try {
+      const saved = await getProject(API_URL, id);
+      adoptProject(saved);
+      setBrief(saved.brief);
+      remember("paypilot_brief", saved.brief);
+      const savedAnalysis = isAnalysis(saved.analysis) ? saved.analysis : null;
+      setAnalysis(savedAnalysis);
+      remember("paypilot_analysis", savedAnalysis);
+      const savedProposal = saved.proposal ? loadSavedProposal(JSON.stringify(saved.proposal)) : null;
+      const current = savedProposal ? syncSchedule(savedProposal) : null;
+      setProposal(current);
+      remember("paypilot_proposal", current);
+      setProposalDirty(false);
+      if (options.show !== false) setView("workspace");
+    } catch (err) {
+      if (err instanceof ApiError && (err.status === 404 || err.status === 401)) closeProject();
+      setProjectError(err instanceof Error ? err.message : "Could not open the project.");
+    }
+  }
+
+  // After a refresh or the PayPal redirect, reopen the project that was open.
+  useEffect(() => {
+    let saved: string | null = null;
+    try {
+      saved = sessionStorage.getItem(PROJECT_STORAGE_KEY);
+    } catch {
+      saved = null;
+    }
+    // Reload the data only; the page keeps its current view.
+    if (saved) void openProject(saved, { show: false });
+    // Runs once on load.
+    // oxlint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Saves the brief first if it was edited, so the project keeps the brief
+  // its AI results were produced from.
+  async function saveBriefIfChanged(target: ProjectDetail): Promise<ProjectDetail> {
+    const current = brief.trim();
+    if (current === target.brief) return target;
+    return updateProject(API_URL, target.id, { brief: current });
+  }
+
+  async function saveToProject(task: (target: ProjectDetail) => Promise<ProjectDetail>, notice: string) {
+    if (!project) return;
+    setProjectSaving(true);
+    setProjectError("");
+    try {
+      const saved = await task(project);
+      adoptProject(saved);
+      setProjectNotice(notice);
+      refreshData();
+      return true;
+    } catch (err) {
+      setProjectError(accessProblemFor(err) ?? (err instanceof Error ? err.message : "Could not save to the project."));
+      return false;
+    } finally {
+      setProjectSaving(false);
+    }
+  }
+
+  function accessProblemFor(err: unknown): string | undefined {
+    if (!(err instanceof ApiError)) return undefined;
+    if (err.code === "SUBSCRIPTION_REQUIRED") return "Saving proposals and risk reviews is a Pro feature. Start the free trial on the Account & billing page.";
+    return accessProblem(err.status, err.body);
+  }
+
+  async function saveProposal() {
+    if (!proposal) return;
+    const saved = await saveToProject(
+      async (target) => saveProjectDocument(API_URL, (await saveBriefIfChanged(target)).id, "proposal", proposal),
+      "Proposal saved.",
+    );
+    if (saved) setProposalDirty(false);
+  }
+
+  async function changeProjectStatus(changes: { status?: ProjectStatus; proposalStatus?: ProposalStatus }) {
+    await saveToProject((target) => updateProject(API_URL, target.id, changes), "Status updated.");
+  }
+
+  function saveAiReview(review: AiReview) {
+    void saveToProject((target) => saveProjectDocument(API_URL, target.id, "risk-review", review), "Risk review saved to the project.");
+  }
+
+  // A project created from the dashboard: if it was started from the brief in
+  // the workspace, keep the analysis and proposal already made for it.
+  async function projectCreated(created: ProjectDetail) {
+    if (project || created.brief !== brief.trim() || (!analysis && !proposal)) {
+      await openProject(created.id);
+      refreshData();
+      return;
+    }
+    adoptProject(created);
+    setView("workspace");
+    let latest = created;
+    try {
+      if (analysis) latest = await saveProjectDocument(API_URL, latest.id, "analysis", analysis);
+      if (proposal) latest = await saveProjectDocument(API_URL, latest.id, "proposal", proposal);
+      setProposalDirty(false);
+      setProjectNotice("Project created with the current analysis and proposal.");
+    } catch (err) {
+      setProposalDirty(Boolean(proposal));
+      setProjectError(accessProblemFor(err) ?? (err instanceof Error ? err.message : "Could not save everything to the project."));
+    }
+    adoptProject(latest);
+    refreshData();
+  }
+
+  // The message for a refused AI request: the access reason when there is
+  // one (the server decides access), otherwise the server error.
+  function aiRequestError(response: Response, data: { error?: string }, fallback: string): Error {
+    const problem = accessProblem(response.status, data);
+    if (problem) setAccountRefresh((value) => value + 1);
+    return new Error(problem ?? data.error ?? fallback);
+  }
 
   useEffect(() => {
     let active = true;
@@ -128,13 +353,19 @@ function App() {
       );
 
       if (!response.ok || !data.analysis) {
-        throw new Error(data.error ?? "Analysis failed.");
+        throw aiRequestError(response, data, "Analysis failed.");
       }
 
       const result = data.analysis;
       setAnalysis(result);
       sessionStorage.setItem("paypilot_analysis", JSON.stringify(result));
       sessionStorage.setItem("paypilot_brief", brief);
+      if (project) {
+        await saveToProject(
+          async (target) => saveProjectDocument(API_URL, (await saveBriefIfChanged(target)).id, "analysis", result),
+          "Analysis saved to the project.",
+        );
+      }
     } catch (err) {
       setError(
         err instanceof Error
@@ -143,6 +374,8 @@ function App() {
       );
     } finally {
       setLoading(false);
+      // Analyses count towards the monthly allowance.
+      refreshData();
     }
   }
 
@@ -177,11 +410,19 @@ function App() {
       );
 
       if (!response.ok || !data.proposal) {
-        throw new Error(data.error ?? "Could not draft the proposal.");
+        throw aiRequestError(response, data, "Could not draft the proposal.");
       }
 
-      updateProposal(toEditableProposal(data.proposal, brief));
+      const draft = toEditableProposal(data.proposal, brief);
+      updateProposal(draft);
       sessionStorage.setItem("paypilot_brief", brief);
+      if (project) {
+        const saved = await saveToProject(
+          async (target) => saveProjectDocument(API_URL, (await saveBriefIfChanged(target)).id, "proposal", draft),
+          "New proposal draft saved to the project.",
+        );
+        setProposalDirty(!saved);
+      }
     } catch (err) {
       setProposalError(
         err instanceof Error ? err.message : "Could not connect to the backend.",
@@ -191,46 +432,10 @@ function App() {
     }
   }
 
-  async function startPayPalCheckout() {
-    setPaymentLoading(true);
-    setPaymentMessage("");
-    setPaymentError("");
-    setRecheckOrderID(null);
-
-    try {
-      const { response, data } = await requestJson<PayPalOrder>(
-        `${API_URL}/api/payments/create-order`,
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({}),
-        },
-      );
-
-      if (!response.ok || !data.orderID || !data.approveUrl) {
-        throw new Error(data.error ?? "Could not create PayPal order.");
-      }
-
-      sessionStorage.setItem("paypilot_order_id", data.orderID);
-      window.location.assign(data.approveUrl);
-    } catch (err) {
-      setPaymentError(
-        err instanceof Error ? err.message : "PayPal checkout failed.",
-      );
-      setPaymentLoading(false);
-    }
-  }
-
   // Show the backend's verified status. The success message uses only the
   // amount and currency the backend reports; never frontend values.
   function showPaymentStatus(data: OrderPaymentStatus) {
-    const confirmed = Boolean(
-      data.paymentStatus === "PAID" &&
-        data.paid === true &&
-        data.captureStatus === "COMPLETED" &&
-        data.amount &&
-        data.currency,
-    );
+    const confirmed = isConfirmedPayment(data);
 
     setPaymentMessage(
       confirmed
@@ -251,9 +456,10 @@ function App() {
     );
   }
 
-  // The backend no longer knows the order (for example, after a restart).
+  // The backend doesn't know the order (for example, it was created against a
+  // different server or database).
   function forgetUnknownOrder(message: string) {
-    sessionStorage.removeItem("paypilot_order_id");
+    forgetCheckout(sessionStorage);
     setPaymentMessage("");
     setPaymentError(message);
     setRecheckOrderID(null);
@@ -262,8 +468,18 @@ function App() {
   // Capture an order the backend registered, or safely check it again.
   // Repeating this for the same order never creates a new order or a second
   // payment: the backend answers settled orders itself and reuses PayPal's
-  // idempotent request for the rest.
+  // idempotent request for the rest. Only the tab that started the checkout
+  // has its checkout token, which the backend requires.
   async function verifyPayment(orderID: string) {
+    const saved = readSavedCheckout(sessionStorage);
+    if (!saved || saved.orderID !== orderID) {
+      forgetUnknownOrder(
+        "This checkout can only be confirmed in the browser tab that started it. Start a new checkout.",
+      );
+      return;
+    }
+    if (paymentRequestActive.current) return;
+    paymentRequestActive.current = true;
     setPaymentLoading(true);
     setPaymentMessage("Confirming your payment with PayPal...");
     setPaymentError("");
@@ -275,7 +491,7 @@ function App() {
         {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ orderID }),
+          body: JSON.stringify({ orderID, checkoutToken: saved.checkoutToken }),
         },
       );
 
@@ -297,15 +513,17 @@ function App() {
       setRecheckOrderID(orderID);
     } finally {
       setPaymentLoading(false);
+      paymentRequestActive.current = false;
     }
   }
 
   // After a page refresh, show the saved order's status. This only reads the
   // backend's record; it never captures.
-  async function loadPaymentStatus(orderID: string) {
+  async function loadPaymentStatus(orderID: string, checkoutToken: string) {
     try {
       const { response, data } = await requestJson<OrderPaymentStatus>(
         `${API_URL}/api/payments/orders/${encodeURIComponent(orderID)}`,
+        { headers: { [CHECKOUT_TOKEN_HEADER]: checkoutToken } },
       );
 
       if (response.status === 404) {
@@ -329,41 +547,83 @@ function App() {
   }
 
   useEffect(() => {
-    const params = new URLSearchParams(window.location.search);
-    const paymentStatus = params.get("payment");
-    const savedOrderID = sessionStorage.getItem("paypilot_order_id");
+    const saved = readSavedCheckout(sessionStorage);
+    const action = readPaymentReturn(window.location.search, saved?.orderID ?? null);
 
-    if (paymentStatus === "cancel") {
-      sessionStorage.removeItem("paypilot_order_id");
+    if (action.kind === "cancelled") {
+      forgetCheckout(sessionStorage);
       setPaymentMessage("");
       setPaymentError("PayPal checkout was cancelled. No payment was confirmed.");
       window.history.replaceState({}, "", window.location.pathname);
       return;
     }
 
-    if (paymentStatus !== "return") {
+    if (action.kind === "none") {
       // Page refresh: recover the saved order's status from the backend.
-      if (savedOrderID) void loadPaymentStatus(savedOrderID);
+      if (saved && action.recoverOrderID === saved.orderID) {
+        void loadPaymentStatus(saved.orderID, saved.checkoutToken);
+      }
       return;
     }
-
-    const returnedToken = params.get("token");
 
     // Clear the return parameters first, so a refresh (or React's development
     // double-run) recovers the status instead of starting another capture.
     window.history.replaceState({}, "", window.location.pathname);
 
-    if (!savedOrderID || !returnedToken || returnedToken !== savedOrderID) {
+    if (action.kind === "mismatch") {
       setPaymentError(
         "Could not verify the returned order. Please check your Sandbox order.",
       );
       return;
     }
 
-    void verifyPayment(savedOrderID);
+    void verifyPayment(action.orderID);
   }, []);
 
+  const navItems: Array<[View, string]> = [
+    ["dashboard", "Dashboard"],
+    ["workspace", project ? `Workspace · ${project.name.length > 18 ? `${project.name.slice(0, 17)}…` : project.name}` : "Workspace"],
+    ["billing", "Account & billing"],
+  ];
+
   return (
+    <div className="app-shell">
+      <aside className="sidebar" aria-label="Main navigation">
+        <nav>
+          {navItems.map(([id, label]) => (
+            <button
+              key={id}
+              type="button"
+              className={view === id ? "nav-item active" : "nav-item"}
+              aria-current={view === id ? "page" : undefined}
+              onClick={() => {
+                setDashboardForm(false);
+                setView(id);
+              }}
+            >
+              {label}
+            </button>
+          ))}
+        </nav>
+        <div className="usage-meter" aria-live="polite">
+          {usage ? (
+            <>
+              <strong>{usage.plan === "PRO" ? "Pro plan" : "Free plan"}</strong>
+              <span>{describeUsage(usage).split(" · ")[1]}</span>
+              <div className="usage-bar" role="progressbar" aria-valuemin={0} aria-valuemax={usage.analyses.limit} aria-valuenow={usage.analyses.used}>
+                <div style={{ width: `${Math.min(100, (usage.analyses.used / usage.analyses.limit) * 100)}%` }} />
+              </div>
+              {usage.plan === "FREE" && (
+                <button className="text-button" type="button" onClick={() => setView("billing")}>
+                  Upgrade to Pro
+                </button>
+              )}
+            </>
+          ) : (
+            <span className="muted">Sign in to see your plan.</span>
+          )}
+        </div>
+      </aside>
     <main className="app">
       <header className="topbar">
         <a className="brand" href="/">
@@ -373,18 +633,161 @@ function App() {
         <span className="local-badge">{providerLabels.badge}</span>
       </header>
 
-      <section className="hero">
-        <p className="eyebrow">FREELANCER WORKSPACE</p>
-        <h1>
-          Clear scope.
-          <br />
-          Confident payments.
-        </h1>
-        <p className="subtitle">
-          Turn client requests into structured proposals. Find missing terms
-          before approving work or requesting payment.
-        </p>
-      </section>
+      {view === "dashboard" && (
+        <Dashboard
+          apiUrl={API_URL}
+          refreshKey={dataRefresh + accountRefresh}
+          workspaceBrief={project ? "" : brief}
+          carriesUnsavedWork={!project && Boolean(analysis || proposal)}
+          startWithForm={dashboardForm}
+          currentProjectId={project?.id ?? null}
+          onOpen={(id) => void openProject(id)}
+          onCreated={(created) => void projectCreated(created)}
+          onSignIn={() => setView("billing")}
+        />
+      )}
+
+      {view === "billing" && (
+        <section className="billing">
+          <AccountPanel apiUrl={API_URL} refreshKey={accountRefresh} onAccountChange={refreshData} />
+          <div className="plan-grid">
+            <div className={usage?.plan === "FREE" ? "plan-card current" : "plan-card"}>
+              <h3>Free</h3>
+              <p className="plan-price">USD 0</p>
+              <ul>
+                <li>2 AI brief analyses per month</li>
+                <li>Project workspace and saved project history</li>
+              </ul>
+            </div>
+            <div className={usage?.plan === "PRO" ? "plan-card current" : "plan-card"}>
+              <h3>Pro</h3>
+              <p className="plan-price">7-day free trial, then USD 5.00/month</p>
+              <ul>
+                <li>30 AI brief analyses per month</li>
+                <li>AI proposal drafting and AI risk reviews</li>
+                <li>Saved proposals and risk reviews, with proposal status tracking</li>
+              </ul>
+            </div>
+          </div>
+          {usage && <p className="muted">{describeUsage(usage)}. Resets {new Date(usage.period.resetsAt).toLocaleDateString()}.</p>}
+        </section>
+      )}
+
+      {view === "workspace" && (
+      <>
+      {project ? (
+        <section className="project-bar" aria-label="Open project">
+          <div>
+            <p className="eyebrow">PROJECT</p>
+            <h2>{project.name}</h2>
+            <p className="muted">
+              {project.clientName || "No client name"} · Budget: {formatBudget(project) ?? "not entered"} · Deadline:{" "}
+              {project.deadline ?? "not entered"}
+            </p>
+          </div>
+          <ol className="step-tracker" aria-label="Project steps">
+            {[
+              ["step-brief", "Client brief", brief.trim().length >= 20],
+              ["step-analysis", "Scope analysis", Boolean(analysis) && project.hasAnalysis],
+              ["step-proposal", "Proposal", project.hasProposal],
+              ["step-review", "Risk review", project.hasRiskReview],
+              ["step-status", "Project status", project.proposalStatus !== null && project.proposalStatus !== "DRAFT"],
+            ].map(([target, label, done], index) => (
+              <li key={String(target)} className={done ? "done" : undefined}>
+                <button
+                  type="button"
+                  onClick={() => document.getElementById(String(target))?.scrollIntoView({ behavior: "smooth", block: "start" })}
+                >
+                  <span className="step-index" aria-hidden="true">{done ? "✓" : index + 1}</span>
+                  {String(label)}
+                  <span className="visually-hidden">{done ? " (done)" : " (to do)"}</span>
+                </button>
+              </li>
+            ))}
+          </ol>
+          <div className="project-bar-controls" id="step-status">
+            <p className="eyebrow">STEP 05 · PROJECT STATUS</p>
+            <label>
+              Project status
+              <select
+                value={project.status}
+                disabled={projectSaving}
+                onChange={(event) => void changeProjectStatus({ status: event.target.value as ProjectStatus })}
+              >
+                {Object.entries(PROJECT_STATUS_LABELS).map(([value, label]) => (
+                  <option key={value} value={value}>
+                    {label}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label>
+              Proposal status
+              <select
+                value={project.proposalStatus ?? ""}
+                disabled={projectSaving || !project.proposalStatus}
+                onChange={(event) => void changeProjectStatus({ proposalStatus: event.target.value as ProposalStatus })}
+              >
+                {!project.proposalStatus && <option value="">Not saved yet</option>}
+                {Object.entries(PROPOSAL_STATUS_LABELS).map(([value, label]) => (
+                  <option key={value} value={value}>
+                    {label}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <button
+              className="secondary-button"
+              type="button"
+              disabled={!proposal || !proposalDirty || projectSaving}
+              onClick={() => void saveProposal()}
+            >
+              {projectSaving ? "Saving…" : proposalDirty ? "Save proposal" : project.proposalStatus ? "Proposal saved" : "No proposal yet"}
+            </button>
+            <button className="text-button" type="button" onClick={closeProject}>
+              Close project
+            </button>
+          </div>
+          {projectNotice && <p role="status">{projectNotice}</p>}
+          {projectError && (
+            <p className="error-message" role="alert">
+              {projectError}
+            </p>
+          )}
+        </section>
+      ) : (
+        <section className="empty-state workspace-empty">
+          <div className="empty-icon">✳</div>
+          <h2>No project is open</h2>
+          <p>
+            Each project keeps one client's brief, scope analysis, proposal and risk review together, saved to your
+            account.
+            {(analysis || proposal) && " This tab also has unsaved work; create a project to keep it."}
+          </p>
+          <div className="workspace-empty-actions">
+            <button
+              className="primary-button"
+              type="button"
+              onClick={() => {
+                setDashboardForm(true);
+                setView("dashboard");
+              }}
+            >
+              Create a project
+            </button>
+            <button className="secondary-button" type="button" onClick={() => setView("dashboard")}>
+              Open a saved project
+            </button>
+          </div>
+          {projectError && (
+            <p className="error-message" role="alert">
+              {projectError}
+            </p>
+          )}
+        </section>
+      )}
+      </>
+      )}
 
       {(paymentMessage || paymentError) && (
         <section className="payment-notice" aria-live="polite">
@@ -407,8 +810,10 @@ function App() {
         </section>
       )}
 
+      {view === "workspace" && project && (
+      <>
       <section className="workspace">
-        <div className="panel brief-panel">
+        <div className="panel brief-panel" id="step-brief">
           <div className="panel-heading">
             <div>
               <p className="eyebrow">STEP 01</p>
@@ -429,6 +834,15 @@ function App() {
             rows={9}
             maxLength={5000}
           />
+
+          {brief.trim() !== project.brief && (
+            <p className="muted unsaved-note">
+              The brief has unsaved edits.{" "}
+              <button className="text-button" type="button" onClick={() => void saveBrief()} disabled={projectSaving}>
+                Save brief
+              </button>
+            </p>
+          )}
 
           <div className="input-footer">
             <span>{brief.length}/5000 characters</span>
@@ -469,7 +883,7 @@ function App() {
           {proposalError && <p className="error-message">{proposalError}</p>}
         </div>
 
-        <div className="results-column">
+        <div className="results-column" id="step-analysis">
           {!analysis && !loading && (
             <div className="empty-state">
               <div className="empty-icon">✳</div>
@@ -493,7 +907,7 @@ function App() {
             <div className="report">
               <div className="report-heading">
                 <div>
-                  <p className="eyebrow">SCOPEGUARD REPORT</p>
+                  <p className="eyebrow">STEP 02 · SCOPE ANALYSIS</p>
                   <h2>Project analysis</h2>
                 </div>
                 <span className="status-pill">Analysis complete</span>
@@ -549,33 +963,9 @@ function App() {
                 items={analysis.client_questions}
               />
 
-              <section className="payment-panel">
-                <p className="eyebrow">STEP 03</p>
-                <h3>Test your checkout</h3>
-                <p>
-                  Create a {PAYMENT_CURRENCY} {PAYMENT_AMOUNT} PayPal Sandbox
-                  order. This is a test payment, not a real charge.
-                </p>
-
-                <button
-                  className="primary-button"
-                  type="button"
-                  onClick={startPayPalCheckout}
-                  disabled={paymentLoading}
-                >
-                  {paymentLoading
-                    ? "Processing..."
-                    : `Continue with PayPal · ${PAYMENT_CURRENCY} ${PAYMENT_AMOUNT}`}
-                </button>
-
-                {paymentLoading && (
-                  <p role="status">Waiting for PayPal...</p>
-                )}
-              </section>
-
               <p className="disclaimer">
                 AI-generated review. Verify all terms before approving a
-                proposal. Sandbox checkout is for testing only.
+                proposal.
               </p>
             </div>
           )}
@@ -596,15 +986,31 @@ function App() {
 
       {!proposalLoading && proposal && (
         <>
-          <ProposalEditor proposal={proposal} onChange={updateProposal} />
+          <div id="step-proposal">
+          <ProposalEditor
+            proposal={proposal}
+            onChange={(next) => {
+              updateProposal(next);
+              if (project) setProposalDirty(true);
+            }}
+          />
+          </div>
+          <div id="step-review">
           <ProposalRiskReview
+            key={project?.id ?? "scratch"}
             proposal={proposal}
             apiUrl={API_URL}
             aiProvider={aiProvider}
+            savedReview={project ? ((project.riskReview as AiReview | null) ?? null) : undefined}
+            onAiReview={project ? saveAiReview : undefined}
           />
+          </div>
         </>
       )}
+      </>
+      )}
     </main>
+    </div>
   );
 }
 

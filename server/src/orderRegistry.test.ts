@@ -6,9 +6,10 @@ import assert from "node:assert/strict";
 import { once } from "node:events";
 import type { AddressInfo } from "node:net";
 import express from "express";
-import { OrderRegistry, isValidOrderID } from "./orderRegistry.js";
+import { OrderRegistry, isValidOrderID, type OrderRegistryPort } from "./orderRegistry.js";
 import { createPaymentRouter, type RunCapture } from "./paymentRoutes.js";
 import { capturePayPalOrder, type ExpectedAmount } from "./paypalCapture.js";
+import { createCheckoutToken } from "./checkoutToken.js";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -17,6 +18,8 @@ import path from "node:path";
 const ORDER_ID = "5O190127TN364715T";
 const EXPECTED: ExpectedAmount = { value: "5.00", currency: "USD" };
 const silentLogger = { log() {}, error() {} };
+// The checkout token of the browser that created ORDER_ID.
+const CHECKOUT = createCheckoutToken();
 
 type PayPalStep = { status: number; body: unknown } | { throws: unknown };
 
@@ -39,32 +42,50 @@ const timeout = () => ({
   throws: new DOMException("The operation timed out.", "TimeoutError"),
 });
 
-// Runs the real capture logic against scripted PayPal responses.
+// Runs the real capture logic against scripted PayPal responses. Each
+// capture first checks the order's status; this fake answers that check
+// with an order in `approvalStatus` (APPROVED unless a test changes it) and
+// counts it separately, so `requests()` still counts the scripted capture
+// and lookup requests.
 function mockPayPal(steps: PayPalStep[]) {
   let requests = 0;
-  const runCapture: RunCapture = (orderID, expected) =>
-    capturePayPalOrder(orderID, expected, {
+  let approvalChecks = 0;
+  let approvalStatus = "APPROVED";
+  const runCapture: RunCapture = (orderID, expected) => {
+    let checked = false;
+    return capturePayPalOrder(orderID, expected, {
       baseUrl: "https://paypal.test",
       accessToken: "fake-access-token-for-tests",
       logger: silentLogger,
-      fetch: async () => {
+      fetch: async (_url, init) => {
+        // Slow PayPal down slightly so concurrent requests overlap.
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        if (!checked) {
+          checked = true;
+          assert.equal(init.method, "GET", "the order is checked before capturing");
+          approvalChecks++;
+          return new Response(JSON.stringify({ id: orderID, status: approvalStatus }), { status: 200 });
+        }
         requests++;
         const step = steps.shift();
         if (!step) throw new Error("Unexpected extra PayPal request");
         if ("throws" in step) throw step.throws;
-        // Slow PayPal down slightly so concurrent requests overlap.
-        await new Promise((resolve) => setTimeout(resolve, 20));
         return new Response(JSON.stringify(step.body), { status: step.status });
       },
     });
+  };
   return {
     runCapture,
     requests: () => requests,
+    approvalChecks: () => approvalChecks,
+    setApprovalStatus: (status: string) => {
+      approvalStatus = status;
+    },
     addSteps: (...more: PayPalStep[]) => steps.push(...more),
   };
 }
 
-async function startApi(t: TestContext, registry: OrderRegistry, runCapture: RunCapture) {
+async function startApi(t: TestContext, registry: OrderRegistryPort, runCapture: RunCapture) {
   const app = express();
   app.use(express.json());
   app.use(createPaymentRouter(registry, runCapture));
@@ -81,30 +102,34 @@ async function startApi(t: TestContext, registry: OrderRegistry, runCapture: Run
     };
   };
 
+  // Both send this browser's checkout token unless a test passes another.
   return {
-    capture: (orderID: unknown) =>
+    capture: (orderID: unknown, checkoutToken: unknown = CHECKOUT.token) =>
       call("/capture-order", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ orderID }),
+        body: JSON.stringify({ orderID, checkoutToken }),
       }),
-    status: (orderID: string) => call(`/orders/${encodeURIComponent(orderID)}`),
+    status: (orderID: string, checkoutToken: string | null = CHECKOUT.token) =>
+      call(`/orders/${encodeURIComponent(orderID)}`, {
+        headers: checkoutToken === null ? {} : { "X-Checkout-Token": checkoutToken },
+      }),
   };
 }
 
-function registryWithOrder(expected = EXPECTED) {
+async function registryWithOrder(expected = EXPECTED) {
   const registry = new OrderRegistry();
-  registry.register(ORDER_ID, expected);
+  await registry.register(ORDER_ID, expected, CHECKOUT.hash);
   return registry;
 }
 
-test("registering an order records the expected amount, currency, time, and status", () => {
+test("registering an order records the expected amount, currency, time, and status", async () => {
   const createdAt = new Date("2026-10-24T12:00:00Z");
   const registry = new OrderRegistry({ now: () => createdAt });
 
-  registry.register(ORDER_ID, EXPECTED);
+  await registry.register(ORDER_ID, EXPECTED);
 
-  assert.deepEqual(registry.get(ORDER_ID), {
+  assert.deepEqual(await registry.get(ORDER_ID), {
     orderID: ORDER_ID,
     expected: EXPECTED,
     createdAt,
@@ -115,19 +140,26 @@ test("registering an order records the expected amount, currency, time, and stat
     capturedAmount: null,
     capturedCurrency: null,
     message: null,
+    checkoutTokenHash: null,
   });
+
+  // The checkout token's hash is stored, never the token itself.
+  await registry.register("ORDER-WITH-TOKEN", EXPECTED, CHECKOUT.hash);
+  const withToken = await registry.get("ORDER-WITH-TOKEN");
+  assert.equal(withToken?.checkoutTokenHash, CHECKOUT.hash);
+  assert.ok(!JSON.stringify(withToken).includes(CHECKOUT.token));
 });
 
-test("the registry preserves older unpaid orders", () => {
+test("the registry preserves older unpaid orders", async () => {
   const registry = new OrderRegistry();
 
-  registry.register("ORDER1", EXPECTED);
-  registry.register("ORDER2", EXPECTED);
-  registry.register("ORDER3", EXPECTED);
+  await registry.register("ORDER1", EXPECTED);
+  await registry.register("ORDER2", EXPECTED);
+  await registry.register("ORDER3", EXPECTED);
 
-  assert.ok(registry.get("ORDER1"));
-  assert.ok(registry.get("ORDER2"));
-  assert.ok(registry.get("ORDER3"));
+  assert.ok(await registry.get("ORDER1"));
+  assert.ok(await registry.get("ORDER2"));
+  assert.ok(await registry.get("ORDER3"));
 
   registry.close();
 });
@@ -139,7 +171,7 @@ test("order ID validation accepts PayPal IDs and rejects anything else", () => {
 });
 
 test("status lookup returns the known status without buyer data", async (t) => {
-  const api = await startApi(t, registryWithOrder(), mockPayPal([]).runCapture);
+  const api = await startApi(t, await registryWithOrder(), mockPayPal([]).runCapture);
 
   const { status, body } = await api.status(ORDER_ID);
 
@@ -155,7 +187,7 @@ test("status lookup returns the known status without buyer data", async (t) => {
 
 test("unknown order IDs get a safe 404 and never reach PayPal", async (t) => {
   const paypal = mockPayPal([]);
-  const api = await startApi(t, registryWithOrder(), paypal.runCapture);
+  const api = await startApi(t, await registryWithOrder(), paypal.runCapture);
 
   const lookup = await api.status("8XY12345AB678901C");
   const capture = await api.capture("8XY12345AB678901C");
@@ -168,7 +200,7 @@ test("unknown order IDs get a safe 404 and never reach PayPal", async (t) => {
 
 test("malformed order IDs are rejected with 400", async (t) => {
   const paypal = mockPayPal([]);
-  const api = await startApi(t, registryWithOrder(), paypal.runCapture);
+  const api = await startApi(t, await registryWithOrder(), paypal.runCapture);
 
   assert.equal((await api.status("bad id!")).status, 400);
   assert.equal((await api.capture("bad id!")).status, 400);
@@ -178,7 +210,7 @@ test("malformed order IDs are rejected with 400", async (t) => {
 
 test("a verified capture marks the order paid, and repeat checks never call PayPal again", async (t) => {
   const paypal = mockPayPal([{ status: 201, body: capturedOrder() }]);
-  const api = await startApi(t, registryWithOrder(), paypal.runCapture);
+  const api = await startApi(t, await registryWithOrder(), paypal.runCapture);
 
   const capture = await api.capture(ORDER_ID);
   assert.equal(capture.status, 200);
@@ -204,7 +236,7 @@ test("a capture that doesn't match the registered amount is never paid", async (
   const paypal = mockPayPal([{ status: 201, body: capturedOrder() }]);
   const api = await startApi(
     t,
-    registryWithOrder({ value: "10.00", currency: "USD" }),
+    await registryWithOrder({ value: "10.00", currency: "USD" }),
     paypal.runCapture,
   );
 
@@ -225,7 +257,7 @@ for (const [captureStatus, paymentStatus] of [
 ] as const) {
   test(`a ${captureStatus} capture is recorded as ${paymentStatus}, not paid`, async (t) => {
     const paypal = mockPayPal([{ status: 201, body: capturedOrder(captureStatus) }]);
-    const api = await startApi(t, registryWithOrder(), paypal.runCapture);
+    const api = await startApi(t, await registryWithOrder(), paypal.runCapture);
 
     const capture = await api.capture(ORDER_ID);
     const lookup = await api.status(ORDER_ID);
@@ -239,7 +271,7 @@ for (const [captureStatus, paymentStatus] of [
 
 test("a pending capture can be checked again and becomes paid when PayPal completes it", async (t) => {
   const paypal = mockPayPal([{ status: 201, body: capturedOrder("PENDING") }]);
-  const api = await startApi(t, registryWithOrder(), paypal.runCapture);
+  const api = await startApi(t, await registryWithOrder(), paypal.runCapture);
 
   assert.equal((await api.capture(ORDER_ID)).body.paymentStatus, "PENDING");
 
@@ -254,7 +286,7 @@ test("a pending capture can be checked again and becomes paid when PayPal comple
 test("an unclear result is UNKNOWN, and checking again on the same order can confirm it", async (t) => {
   // Capture times out and the follow-up order lookup fails too.
   const paypal = mockPayPal([timeout(), timeout()]);
-  const api = await startApi(t, registryWithOrder(), paypal.runCapture);
+  const api = await startApi(t, await registryWithOrder(), paypal.runCapture);
 
   const first = await api.capture(ORDER_ID);
   assert.equal(first.status, 200);
@@ -282,7 +314,7 @@ test("if PayPal can't be reached before capture, the order is left unchanged", a
   const failingCapture: RunCapture = async () => {
     throw new Error("PayPal authentication failed: HTTP 503");
   };
-  const api = await startApi(t, registryWithOrder(), failingCapture);
+  const api = await startApi(t, await registryWithOrder(), failingCapture);
   t.mock.method(console, "error", () => {});
 
   const capture = await api.capture(ORDER_ID);
@@ -293,7 +325,7 @@ test("if PayPal can't be reached before capture, the order is left unchanged", a
 
 test("simultaneous capture requests for one order share a single PayPal call", async (t) => {
   const paypal = mockPayPal([{ status: 201, body: capturedOrder() }]);
-  const api = await startApi(t, registryWithOrder(), paypal.runCapture);
+  const api = await startApi(t, await registryWithOrder(), paypal.runCapture);
 
   const results = await Promise.all([api.capture(ORDER_ID), api.capture(ORDER_ID)]);
 
@@ -303,19 +335,19 @@ test("simultaneous capture requests for one order share a single PayPal call", a
   );
   assert.equal(paypal.requests(), 1);
 });
-test("registered orders persist after the registry is reopened", () => {
+test("registered orders persist after the registry is reopened", async () => {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "paypilot-test-"));
   const dbPath = path.join(tempDir, "paypilot.db");
 
   try {
     const firstRegistry = new OrderRegistry({ filename: dbPath });
 
-    firstRegistry.register("PERSIST-ORDER-1", EXPECTED);
+    await firstRegistry.register("PERSIST-ORDER-1", EXPECTED);
     firstRegistry.close();
 
     const secondRegistry = new OrderRegistry({ filename: dbPath });
 
-    const restored = secondRegistry.get("PERSIST-ORDER-1");
+    const restored = await secondRegistry.get("PERSIST-ORDER-1");
 
     assert.ok(restored);
     assert.equal(restored.orderID, "PERSIST-ORDER-1");

@@ -1,6 +1,12 @@
 // Drafts a freelance proposal with the local Ollama model. `fetch` is
 // injected so this can be tested without a running model.
-import { chatJson, type ChatJsonFailure, type OllamaDeps } from "./localModel.js";
+import {
+  chatJson,
+  failureFor,
+  type ChatJsonFailure,
+  type FailureResponse,
+  type OllamaDeps,
+} from "./localModel.js";
 import {
   buildProposalDraft,
   parseProposalOutput,
@@ -29,7 +35,29 @@ Rules:
 - risks: concrete scope or delivery risks, each with a reason.
 - Keep all text short, clear, and professional. Do not give legal advice or claim legal review.`;
 
-const FAILURES: Record<ChatJsonFailure, { status: number; error: string }> = {
+const FAILURES: Record<ChatJsonFailure, FailureResponse> = {
+  "http-error": {
+    status: 502,
+    error: "The AI service could not draft the proposal. Try again.",
+  },
+  timeout: {
+    status: 504,
+    error: "The AI service took too long to draft the proposal. Try again or shorten the brief.",
+  },
+  unavailable: {
+    status: 503,
+    error: "The AI service is not available right now. Try again later.",
+  },
+  empty: { status: 502, error: "The AI returned an empty response. Try again." },
+  truncated: {
+    status: 502,
+    error: "The AI response was cut off before it finished. Try again or shorten the brief.",
+  },
+  malformed: { status: 502, error: "The AI returned malformed output. Try again." },
+};
+
+// Ollama runs on this computer, so its failures can name the local fix.
+const OLLAMA_FAILURES: Partial<typeof FAILURES> = {
   "http-error": {
     status: 502,
     error: "The local AI model could not draft the proposal. Try again.",
@@ -42,12 +70,6 @@ const FAILURES: Record<ChatJsonFailure, { status: number; error: string }> = {
     status: 503,
     error: "Cannot reach the local AI model. Check that Ollama is running.",
   },
-  empty: { status: 502, error: "The AI returned an empty response. Try again." },
-  truncated: {
-    status: 502,
-    error: "The AI response was cut off before it finished. Try again or shorten the brief.",
-  },
-  malformed: { status: 502, error: "The AI returned malformed output. Try again." },
 };
 
 export async function generateProposalDraft(
@@ -66,7 +88,7 @@ export async function generateProposalDraft(
   );
 
   if (!result.ok) {
-    return { ok: false, ...FAILURES[result.failure] };
+    return { ok: false, ...failureFor(deps, result.failure, FAILURES, OLLAMA_FAILURES) };
   }
 
   const { output, invalidFields } = parseProposalOutput(result.value);

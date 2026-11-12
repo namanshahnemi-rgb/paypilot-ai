@@ -1,0 +1,19 @@
+node_modules
+dist
+coverage
+.env
+.env.*
+data/
+*.db
+*.db-shm
+*.db-wal
+*.backup
+*.backup-*
+.git
+.gitignore
+npm-debug.log*
+.DS_Store
+# Local test and editor output
+*.log
+reports/
+.vscode/

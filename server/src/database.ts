@@ -50,7 +50,8 @@ export function openDatabase(options: DatabaseOptions): Database.Database {
       capture_status TEXT,
       captured_amount TEXT,
       captured_currency TEXT,
-      message TEXT
+      message TEXT,
+      checkout_token_hash TEXT
     );
 
     CREATE INDEX IF NOT EXISTS idx_paypal_orders_status
@@ -60,10 +61,18 @@ export function openDatabase(options: DatabaseOptions): Database.Database {
       ON paypal_orders(created_at);
   `);
 
-  db.prepare(`
+  // Version 2: checkout tokens. Older database files get the column added.
+  const columns = db.prepare("PRAGMA table_info(paypal_orders)").all() as Array<{ name: string }>;
+  if (!columns.some((column) => column.name === "checkout_token_hash")) {
+    db.exec("ALTER TABLE paypal_orders ADD COLUMN checkout_token_hash TEXT");
+  }
+
+  const recordMigration = db.prepare(`
     INSERT OR IGNORE INTO schema_migrations (version, applied_at)
-    VALUES (1, ?)
-  `).run(new Date().toISOString());
+    VALUES (?, ?)
+  `);
+  recordMigration.run(1, new Date().toISOString());
+  recordMigration.run(2, new Date().toISOString());
 
   return db;
 }

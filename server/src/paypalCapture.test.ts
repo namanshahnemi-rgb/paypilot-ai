@@ -53,28 +53,44 @@ function paypalError(status: number, issue: string) {
 const completed = (value = "5.00", currency = "USD") =>
   orderBody("COMPLETED", { status: "COMPLETED", value, currency });
 
-async function runCapture(steps: FakeStep[]) {
+// Every capture first looks the order up to check it is approved. `before`
+// is PayPal's answer to that check (an APPROVED order unless a test says
+// otherwise); it is kept out of `calls`, which lists the requests after it.
+async function runCapture(steps: FakeStep[], options: { before?: FakeStep } = {}) {
   const calls: Array<{ url: string; init: RequestInit }> = [];
+  const checks: Array<{ url: string; init: RequestInit }> = [];
   const logLines: string[] = [];
   const record = (...args: unknown[]) => logLines.push(JSON.stringify(args));
+  const before: FakeStep = options.before ?? { status: 200, body: orderBody("APPROVED") };
+
+  const respond = (step: FakeStep) => {
+    if ("throws" in step) throw step.throws;
+    return new Response(JSON.stringify(step.body), {
+      status: step.status,
+      headers: { "paypal-debug-id": "fake-debug-id" },
+    });
+  };
 
   const result = await capturePayPalOrder(ORDER_ID, EXPECTED, {
     baseUrl: "https://paypal.test",
     accessToken: FAKE_TOKEN,
     logger: { log: record, error: record },
     fetch: async (url, init) => {
+      if (checks.length === 0) {
+        checks.push({ url, init });
+        return respond(before);
+      }
       calls.push({ url, init });
       const step = steps.shift();
       if (!step) throw new Error("Unexpected extra PayPal request");
-      if ("throws" in step) throw step.throws;
-      return new Response(JSON.stringify(step.body), {
-        status: step.status,
-        headers: { "paypal-debug-id": "fake-debug-id" },
-      });
+      return respond(step);
     },
   });
 
   assert.equal(steps.length, 0, "every expected PayPal call was made");
+  assert.equal(checks.length, 1, "the order was checked once before anything else");
+  assert.equal(checks[0]?.init.method, "GET");
+  assert.equal(checks[0]?.url, `https://paypal.test/v2/checkout/orders/${ORDER_ID}`);
   assert.ok(
     logLines.every((line) => !line.includes(FAKE_TOKEN)),
     "logs never contain the access token",
@@ -233,4 +249,31 @@ test("a definite rejection such as ORDER_NOT_APPROVED fails without a lookup", a
 
   assert.deepEqual(result, { ok: false, reason: "REJECTED" });
   assert.equal(calls.length, 1);
+});
+
+test("a completed capture in another currency, or of a different amount, is never paid", async () => {
+  // Same number, wrong currency; wrong amount in the right currency; amounts
+  // PayPal could format differently but that are not exactly USD 5.00.
+  for (const [value, currency] of [
+    ["5.00", "EUR"],
+    ["5.00", "usd"],
+    ["5.01", "USD"],
+    ["4.99", "USD"],
+    ["0.05", "USD"],
+    ["500", "USD"],
+    ["5.001", "USD"],
+    ["-5.00", "USD"],
+    ["", "USD"],
+  ] as const) {
+    const { result } = await runCapture([{ status: 201, body: completed(value, currency) }]);
+    const outcome = paidOutcome(result);
+    assert.equal(outcome.paid, false, `${currency} ${value}`);
+    assert.equal(outcome.problem, "AMOUNT_MISMATCH", `${currency} ${value}`);
+  }
+
+  // Equivalent formatting of exactly USD 5.00 is accepted.
+  for (const value of ["5.00", "5", "5.0"]) {
+    const { result } = await runCapture([{ status: 201, body: completed(value) }]);
+    assert.equal(paidOutcome(result).paid, true, value);
+  }
 });

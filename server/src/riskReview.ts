@@ -8,9 +8,11 @@ import { createHash } from "node:crypto";
 import { z } from "zod";
 import {
   chatJson,
+  failureFor,
   parseFields,
   RETRYABLE_FAILURES,
   type ChatJsonFailure,
+  type FailureResponse,
   type OllamaDeps,
 } from "./localModel.js";
 import { quoteFromBrief } from "./proposal.js";
@@ -246,20 +248,29 @@ export function groundFindings(
   return result;
 }
 
-const FAILURES: Record<ChatJsonFailure | "unusable", { status: number; error: string }> = {
-  "http-error": { status: 502, error: "The local AI model could not review the proposal. Try again." },
+const FAILURES: Record<ChatJsonFailure | "unusable", FailureResponse> = {
+  "http-error": { status: 502, error: "The AI service could not review the proposal. Try again." },
   timeout: {
     status: 504,
     error: "The AI review took too long. Try again, or rely on the automatic checks.",
   },
   unavailable: {
     status: 503,
-    error: "Cannot reach the local AI model. Check that Ollama is running.",
+    error: "The AI service is not available right now. Try again later.",
   },
   empty: { status: 502, error: "The AI returned an empty review. Try again." },
   truncated: { status: 502, error: "The AI review was cut off before it finished. Try again." },
   malformed: { status: 502, error: "The AI returned a malformed review. Try again." },
   unusable: { status: 502, error: "The AI did not return a usable review. Try again." },
+};
+
+// Ollama runs on this computer, so its failures can name the local fix.
+const OLLAMA_FAILURES: Partial<typeof FAILURES> = {
+  "http-error": { status: 502, error: "The local AI model could not review the proposal. Try again." },
+  unavailable: {
+    status: 503,
+    error: "Cannot reach the local AI model. Check that Ollama is running.",
+  },
 };
 
 export type AiReviewResult =
@@ -311,5 +322,5 @@ export async function reviewProposalWithAI(
     return { ok: true, findings, discarded: raw.findings.length - findings.length };
   }
 
-  return { ok: false, ...FAILURES[failure] };
+  return { ok: false, ...failureFor(deps, failure, FAILURES, OLLAMA_FAILURES) };
 }

@@ -1,0 +1,9 @@
+{
+  // Production build (npm run build, and the Docker image). It compiles only
+  // the files the server loads, starting at src/index.ts, so tests and the
+  // SQLite test registry (orderRegistry.ts, database.ts) are not in dist/.
+  // Type checking still covers every file: tsc --noEmit -p . uses
+  // tsconfig.json.
+  "extends": "./tsconfig.json",
+  "files": ["src/index.ts"]
+}

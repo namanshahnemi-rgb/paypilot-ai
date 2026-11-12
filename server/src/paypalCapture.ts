@@ -56,7 +56,11 @@ export type CaptureOutcome = {
 
 export type CaptureResult =
   | { ok: true; outcome: CaptureOutcome; source: "capture" | "lookup" }
-  | { ok: false; reason: "REJECTED" | "STATUS_UNKNOWN" };
+  | { ok: false; reason: "REJECTED" | "STATUS_UNKNOWN" }
+  // The order isn't approved by the buyer yet (CREATED, SAVED, or
+  // PAYER_ACTION_REQUIRED), or was voided. No capture request was sent.
+  | { ok: false; reason: "NOT_APPROVED"; orderStatus: string | null }
+  | { ok: false; reason: "VOIDED"; orderStatus: string | null };
 
 type FetchLike = (url: string, init: RequestInit) => Promise<Response>;
 type Logger = {
@@ -68,9 +72,19 @@ export type CaptureDeps = {
   fetch: FetchLike;
   baseUrl: string;
   accessToken: string;
+  // The capture request's timeout (default 15 s).
   timeoutMs?: number;
+  // Each order lookup's timeout (default 10 s). With the access token
+  // request (15 s), one capture makes at most four PayPal requests taking
+  // at most about 50 s, inside the 60 s lock-hold limit.
+  lookupTimeoutMs?: number;
   logger?: Logger;
 };
+
+// PayPal Orders v2 order statuses (order_status in the published schema):
+// CREATED, SAVED, APPROVED, VOIDED, COMPLETED, PAYER_ACTION_REQUIRED.
+// Only an APPROVED order is sent to the capture endpoint.
+const CAPTURABLE_STATUS = "APPROVED";
 
 // The same order always gets the same PayPal-Request-Id, so a retried capture
 // returns the earlier result instead of attempting a second capture. PayPal
@@ -186,6 +200,7 @@ export async function capturePayPalOrder(
 ): Promise<CaptureResult> {
   const logger = deps.logger ?? console;
   const timeoutMs = deps.timeoutMs ?? 15000;
+  const lookupTimeoutMs = deps.lookupTimeoutMs ?? 10000;
   const orderUrl = `${deps.baseUrl}/v2/checkout/orders/${encodeURIComponent(orderID)}`;
 
   const finish = (
@@ -212,6 +227,62 @@ export async function capturePayPalOrder(
     return { ok: true, outcome, source };
   };
 
+  // Reads the order from PayPal. Any failure means the status is unknown,
+  // which is safe to retry; it is never treated as paid or failed.
+  const lookUp = async (
+    when: "before capture" | "after capture",
+  ): Promise<{ data: PayPalOrderBody; response: Response } | CaptureResult> => {
+    try {
+      const response = await deps.fetch(orderUrl, {
+        method: "GET",
+        headers: { Authorization: `Bearer ${deps.accessToken}` },
+        signal: AbortSignal.timeout(lookupTimeoutMs),
+      });
+      const data = await readJson(response);
+
+      if (!response.ok || !data) {
+        logger.error(`PayPal order lookup ${when} failed:`, {
+          orderID,
+          ...summarizePayPalError(response, data ?? {}),
+        });
+        return { ok: false, reason: "STATUS_UNKNOWN" };
+      }
+      return { data, response };
+    } catch (error) {
+      logger.error(`PayPal order lookup ${when} did not complete:`, {
+        orderID,
+        error: error instanceof Error ? error.name : "UnknownError",
+      });
+      return { ok: false, reason: "STATUS_UNKNOWN" };
+    }
+  };
+
+  // 1. Check the order before capturing. A capture is sent only for an
+  // order the buyer has approved, so a request made too early (or by
+  // someone other than the buyer) never reaches PayPal's capture endpoint
+  // and can't use up this order's stable PayPal-Request-Id with a failure.
+  const before = await lookUp("before capture");
+  if (!("data" in before)) return before;
+
+  const orderStatus = before.data.status ?? null;
+
+  // Already captured, for example by an earlier attempt whose result was
+  // not recorded: evaluate it without capturing again.
+  if (orderStatus === "COMPLETED" || hasCapture(before.data)) {
+    return finish(before.data, before.response, "lookup");
+  }
+
+  if (orderStatus !== CAPTURABLE_STATUS) {
+    const reason = orderStatus === "VOIDED" ? "VOIDED" : "NOT_APPROVED";
+    logger.log("PayPal order is not approved; no capture was sent:", {
+      orderID,
+      orderStatus,
+      debugId: before.response.headers.get("paypal-debug-id"),
+    });
+    return { ok: false, reason, orderStatus };
+  }
+
+  // 2. Capture the approved order.
   try {
     const response = await deps.fetch(`${orderUrl}/capture`, {
       method: "POST",
@@ -249,28 +320,8 @@ export async function capturePayPalOrder(
     });
   }
 
-  try {
-    const response = await deps.fetch(orderUrl, {
-      method: "GET",
-      headers: { Authorization: `Bearer ${deps.accessToken}` },
-      signal: AbortSignal.timeout(timeoutMs),
-    });
-    const data = await readJson(response);
-
-    if (!response.ok || !data) {
-      logger.error("PayPal order lookup failed:", {
-        orderID,
-        ...summarizePayPalError(response, data ?? {}),
-      });
-      return { ok: false, reason: "STATUS_UNKNOWN" };
-    }
-
-    return finish(data, response, "lookup");
-  } catch (error) {
-    logger.error("PayPal order lookup did not complete:", {
-      orderID,
-      error: error instanceof Error ? error.name : "UnknownError",
-    });
-    return { ok: false, reason: "STATUS_UNKNOWN" };
-  }
+  // 3. The capture's result is unclear: check the order again.
+  const after = await lookUp("after capture");
+  if (!("data" in after)) return after;
+  return finish(after.data, after.response, "lookup");
 }
