@@ -28,8 +28,9 @@ RENDER_HOOK_CREDENTIALS_ID = 'render-deploy-hook'   // Secret text: the Render d
 // single quotes only, so it can be passed in double quotes by sh and bat.
 IMAGE_CONTENTS_CHECK = '''const fs=require('fs');const bad=[];try{require.resolve('better-sqlite3');bad.push('better-sqlite3 is installed')}catch(e){}const files=fs.readdirSync('dist');for(const f of files){if(f.includes('.test.')||f.startsWith('orderRegistry.')||f.startsWith('database.'))bad.push('dist/'+f)}if(bad.length){console.error('Not allowed in the runtime image: '+bad.join(', '));process.exit(1)}console.log('Runtime image contents OK: '+files.filter(f=>f.endsWith('.js')).length+' modules, no SQLite driver, no tests.')'''
 
-// Runs a shell command on either agent type.
-def run(String command) {
+// Runs a shell command on either agent type. Not named run: that name is a
+// Jenkins Pipeline symbol, and Declarative rejects run('...') inside steps.
+def executeCommand(String command) {
   if (isUnix()) {
     sh command
   } else {
@@ -46,7 +47,7 @@ def runOutput(String command) {
 def runNpm(String folder, String command, String hint) {
   dir(folder) {
     try {
-      run("npm ${command}")
+      executeCommand("npm ${command}")
     } catch (hudson.AbortException err) {
       error("[${folder}] 'npm ${command}' failed. ${hint}")
     }
@@ -144,9 +145,9 @@ pipeline {
 
     stage('Check toolchain') {
       steps {
-        run('node --version')
-        run('npm --version')
-        run('''node -e "const [a,b]=process.versions.node.split('.').map(Number);if(a<22||(a===22&&b<18)){console.error('Node.js '+process.versions.node+' is too old: PayPilot CI needs Node.js 22.18 or newer, because the client tests run TypeScript files directly with node --test.');process.exit(1)}"''')
+        executeCommand('node --version')
+        executeCommand('npm --version')
+        executeCommand('''node -e "const [a,b]=process.versions.node.split('.').map(Number);if(a<22||(a===22&&b<18)){console.error('Node.js '+process.versions.node+' is too old: PayPilot CI needs Node.js 22.18 or newer, because the client tests run TypeScript files directly with node --test.');process.exit(1)}"''')
       }
     }
 
@@ -212,8 +213,8 @@ pipeline {
         dir('server') {
           // The build stage (all dependencies and sources) runs the tests
           // below; the runtime stage is the image that would be published.
-          run("docker build --pull --target build -t paypilot-server-build:${env.CI_TAG} .")
-          run("docker build -t paypilot-server:${env.CI_TAG} .")
+          executeCommand("docker build --pull --target build -t paypilot-server-build:${env.CI_TAG} .")
+          executeCommand("docker build -t paypilot-server:${env.CI_TAG} .")
         }
       }
     }
@@ -225,8 +226,8 @@ pipeline {
           // A throwaway PostgreSQL on a private Docker network, with no
           // published ports, so no password is needed and no data outside
           // this build is touched. Removed in the post section.
-          run("docker network create ${env.CI_NAME}")
-          run("docker run -d --name ${env.CI_NAME}-db --network ${env.CI_NAME} -e POSTGRES_HOST_AUTH_METHOD=trust -e POSTGRES_DB=paypilot_ci postgres:17-alpine")
+          executeCommand("docker network create ${env.CI_NAME}")
+          executeCommand("docker run -d --name ${env.CI_NAME}-db --network ${env.CI_NAME} -e POSTGRES_HOST_AUTH_METHOD=trust -e POSTGRES_DB=paypilot_ci postgres:17-alpine")
           def ready = false
           for (int attempt = 0; attempt < 30 && !ready; attempt++) {
             def status = isUnix()
@@ -237,7 +238,7 @@ pipeline {
           }
           if (!ready) { error('The throwaway PostgreSQL container did not become ready.') }
           try {
-            run("docker run --rm --network ${env.CI_NAME} -e DATABASE_URL=postgresql://postgres@${env.CI_NAME}-db:5432/paypilot_ci paypilot-server-build:${env.CI_TAG} npm run test:integration")
+            executeCommand("docker run --rm --network ${env.CI_NAME} -e DATABASE_URL=postgresql://postgres@${env.CI_NAME}-db:5432/paypilot_ci paypilot-server-build:${env.CI_TAG} npm run test:integration")
           } catch (hudson.AbortException err) {
             error('The PostgreSQL integration tests failed; the output above names the test. Reproduce with npm run test:integration in server/ against a local database.')
           }
@@ -252,21 +253,21 @@ pipeline {
           // The runtime image holds only production code and dependencies:
           // no SQLite driver, no compiled tests, no SQLite registry (PP-27).
           try {
-            run("docker run --rm paypilot-server:${env.CI_TAG} node -e \"" + IMAGE_CONTENTS_CHECK + "\"")
+            executeCommand("docker run --rm paypilot-server:${env.CI_TAG} node -e \"" + IMAGE_CONTENTS_CHECK + "\"")
           } catch (hudson.AbortException err) {
             error('The runtime image contains test-only code or dependencies; see the line above.')
           }
           // Runs the runtime image with placeholder PayPal values (no PayPal
           // call is made) and checks headers, CORS, origin and JSON rules.
-          run("docker run -d --name ${env.CI_NAME}-api --network ${env.CI_NAME} -e DATABASE_URL=postgresql://postgres@${env.CI_NAME}-db:5432/paypilot_ci -e CLIENT_ORIGINS=https://smoke.example -e PAYPAL_CLIENT_ID=ci-placeholder -e PAYPAL_CLIENT_SECRET=ci-placeholder paypilot-server:${env.CI_TAG}")
+          executeCommand("docker run -d --name ${env.CI_NAME}-api --network ${env.CI_NAME} -e DATABASE_URL=postgresql://postgres@${env.CI_NAME}-db:5432/paypilot_ci -e CLIENT_ORIGINS=https://smoke.example -e PAYPAL_CLIENT_ID=ci-placeholder -e PAYPAL_CLIENT_SECRET=ci-placeholder paypilot-server:${env.CI_TAG}")
           try {
-            run("docker run --rm --network ${env.CI_NAME} -e SMOKE_ALLOW_POST=1 paypilot-server-build:${env.CI_TAG} node scripts/smoke-test.mjs http://${env.CI_NAME}-api:4000 https://smoke.example")
+            executeCommand("docker run --rm --network ${env.CI_NAME} -e SMOKE_ALLOW_POST=1 paypilot-server-build:${env.CI_TAG} node scripts/smoke-test.mjs http://${env.CI_NAME}-api:4000 https://smoke.example")
           } catch (hudson.AbortException err) {
-            run("docker logs ${env.CI_NAME}-api")
+            executeCommand("docker logs ${env.CI_NAME}-api")
             error('The image smoke test failed; see the checks and the API log above.')
           }
           // The image must stop cleanly on SIGTERM (graceful shutdown).
-          run("docker stop -t 15 ${env.CI_NAME}-api")
+          executeCommand("docker stop -t 15 ${env.CI_NAME}-api")
           def exitCode = runOutput("docker inspect -f {{.State.ExitCode}} ${env.CI_NAME}-api")
           if (exitCode != '0') { error("The API container exited with code ${exitCode} on SIGTERM instead of shutting down cleanly.") }
         }
@@ -296,11 +297,11 @@ pipeline {
           }
           try {
             for (tag in ["sha-${commit}", "build-${env.BUILD_NUMBER}", 'latest']) {
-              run("docker tag paypilot-server:${env.CI_TAG} ${image}:${tag}")
-              run("docker push ${image}:${tag}")
+              executeCommand("docker tag paypilot-server:${env.CI_TAG} ${image}:${tag}")
+              executeCommand("docker push ${image}:${tag}")
             }
           } finally {
-            run('docker logout ghcr.io')
+            executeCommand('docker logout ghcr.io')
           }
           env.PUBLISHED_IMAGE = "${image}:sha-${commit}"
           echo "Published ${env.PUBLISHED_IMAGE} (also tagged latest)."
@@ -332,7 +333,7 @@ pipeline {
           sleep(time: 60, unit: 'SECONDS')
           retry(10) {
             sleep(time: 15, unit: 'SECONDS')
-            run("node server/scripts/smoke-test.mjs ${params.PRODUCTION_API_URL} ${params.PRODUCTION_FRONTEND_ORIGIN}")
+            executeCommand("node server/scripts/smoke-test.mjs ${params.PRODUCTION_API_URL} ${params.PRODUCTION_FRONTEND_ORIGIN}")
           }
         }
       }
@@ -345,9 +346,9 @@ pipeline {
         if (params.BUILD_IMAGE && env.CI_NAME) {
           // Best-effort cleanup of this build's containers, network, and images.
           def ignore = isUnix() ? ' || true' : ' || exit /b 0'
-          run("docker rm -f ${env.CI_NAME}-api ${env.CI_NAME}-db${ignore}")
-          run("docker network rm ${env.CI_NAME}${ignore}")
-          run("docker image rm paypilot-server-build:${env.CI_TAG}${ignore}")
+          executeCommand("docker rm -f ${env.CI_NAME}-api ${env.CI_NAME}-db${ignore}")
+          executeCommand("docker network rm ${env.CI_NAME}${ignore}")
+          executeCommand("docker image rm paypilot-server-build:${env.CI_TAG}${ignore}")
         }
       }
       archiveArtifacts artifacts: 'reports/**', allowEmptyArchive: true
