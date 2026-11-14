@@ -20,7 +20,12 @@ import type { Pool } from "pg";
 import { createPostgresPool, PostgresOrderRegistry } from "./postgresOrderRegistry.js";
 import { ACCOUNT_MIGRATIONS, migrateAccountSchema } from "./accountSchema.js";
 import { createAuthModule, readSessionCookieConfig, type AuthModule } from "./auth.js";
-import { createSubscriptionModule, keepRawWebhookBody, type SubscriptionModule } from "./subscriptions.js";
+import {
+  createSubscriptionModule,
+  keepRawWebhookBody,
+  type SubscriptionModule,
+  type SubscriptionModuleOptions,
+} from "./subscriptions.js";
 import { createAdminRouter } from "./adminRoutes.js";
 import { createUsageModule, type UsageModule } from "./usage.js";
 import { createProjectRouter } from "./projects.js";
@@ -66,6 +71,8 @@ type FakeSubscription = {
 const paypal = {
   plan: { id: PLAN_ID, ...planDefinition("PROD-TEST") } as Record<string, unknown>,
   subscriptions: new Map<string, FakeSubscription>(),
+  // Sales as GET /v1/payments/sale/{id} reports them.
+  sales: new Map<string, { id: string; state: string; billing_agreement_id?: string }>(),
   verification: "SUCCESS",
   calls: [] as Array<{ method: string; path: string; body: string | undefined }>,
   counter: 0,
@@ -119,6 +126,11 @@ async function fakePayPalFetch(url: string, init: RequestInit): Promise<Response
       return new Response(null, { status: 204 });
     }
     return json(200, sub);
+  }
+  const sale = /^\/v1\/payments\/sale\/([^/]+)$/.exec(pathname);
+  if (sale && method === "GET") {
+    const found = paypal.sales.get(decodeURIComponent(sale[1]!));
+    return found ? json(200, found) : json(404, { name: "INVALID_RESOURCE_ID" });
   }
   if (method === "POST" && pathname === "/v1/notifications/verify-webhook-signature") {
     return json(200, { verification_status: paypal.verification });
@@ -277,9 +289,9 @@ async function auditCount(action: string, outcome: string, resourceId?: string) 
 }
 
 const CERT = "https://api.sandbox.paypal.com/v1/notifications/certs/CERT-TEST";
-async function deliver(event: Record<string, unknown>, rawOverride?: string) {
+async function deliver(event: Record<string, unknown>, rawOverride?: string, target = base) {
   const raw = rawOverride ?? JSON.stringify(event);
-  const response = await fetch(`${base}/api/paypal/webhooks`, {
+  const response = await fetch(`${target}/api/paypal/webhooks`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -799,6 +811,315 @@ dbTest("non-subscription and unknown-subscription events are acknowledged and ig
   assert.equal(sale.body.ignored, true);
   const unknown = await deliver(subscriptionEvent("BILLING.SUBSCRIPTION.ACTIVATED", "I-UNKNOWNSUB999"));
   assert.equal(unknown.body.ignored, true);
+});
+
+// ---- PayPal webhooks: configuration, events, payments, failures -------------
+
+// A second app with the same webhook middleware as index.ts, built from a
+// subscription module with different options (no webhook id, a failing
+// database, a recording logger).
+async function withWebhookApp(overrides: Partial<SubscriptionModuleOptions>, run: (target: string) => Promise<void>) {
+  const module = createSubscriptionModule({
+    pool: pool!,
+    auth,
+    payPal: { fetch: fakePayPalFetch, baseUrl: "https://api-m.sandbox.paypal.com", getAccessToken: async () => "FAKE-TOKEN" },
+    planId: PLAN_ID,
+    webhookId: WEBHOOK_ID,
+    allowedOrigins: [ORIGIN],
+    now: () => clock,
+    logger: silent,
+    ...overrides,
+  });
+  const app = express();
+  app.use(requireJsonBody);
+  app.use(express.json({ limit: "100kb", verify: keepRawWebhookBody }));
+  app.use(module.router);
+  app.use(jsonErrorHandler);
+  const other = createServer(app).listen(0, "127.0.0.1");
+  await once(other, "listening");
+  try {
+    await run(`http://127.0.0.1:${(other.address() as AddressInfo).port}`);
+  } finally {
+    await new Promise((resolve) => other.close(resolve));
+  }
+}
+
+const verifyCalls = () => paypal.count("POST", "/v1/notifications/verify-webhook-signature");
+const saleId = () => `S${randomBytes(6).toString("hex").toUpperCase()}`;
+function saleEvent(type: string, resource: Record<string, unknown>) {
+  return {
+    id: `WH-PAY-${++eventCounter}-${randomBytes(3).toString("hex")}`,
+    event_type: type,
+    create_time: new Date(clock).toISOString(),
+    resource_type: type === "PAYMENT.SALE.COMPLETED" ? "sale" : "refund",
+    resource,
+  };
+}
+async function storedEvent(eventId: string) {
+  return (await pool!.query("SELECT status, attempts, error FROM paypal_webhook_events WHERE event_id = $1", [eventId])).rows[0];
+}
+async function storedSubscription(rowId: string) {
+  return (await pool!.query("SELECT status, next_billing_time FROM subscriptions WHERE id = $1", [rowId])).rows[0];
+}
+
+// An ACTIVE subscription, confirmed through a verified ACTIVATED webhook.
+async function activeSubscriber() {
+  const subscriber = await registered();
+  const { paypalId, rowId } = await subscribed(subscriber.browser);
+  paypal.setStatus(paypalId, "ACTIVE");
+  assert.equal((await deliver(subscriptionEvent("BILLING.SUBSCRIPTION.ACTIVATED", paypalId, rowId))).status, 200);
+  assert.equal((await call(subscriber.browser, "POST", "/api/proposals/draft", {})).status, 200);
+  return { ...subscriber, paypalId, rowId };
+}
+
+dbTest("without PAYPAL_WEBHOOK_ID every webhook is refused with 503 before PayPal is asked or anything is recorded", async () => {
+  const { browser } = await registered();
+  const { paypalId, rowId } = await subscribed(browser);
+  paypal.setStatus(paypalId, "ACTIVE");
+  await withWebhookApp({ webhookId: undefined }, async (target) => {
+    const before = verifyCalls();
+    const event = subscriptionEvent("BILLING.SUBSCRIPTION.ACTIVATED", paypalId, rowId);
+    const response = await deliver(event, undefined, target);
+    assert.equal(response.status, 503);
+    assert.equal(verifyCalls(), before, "PayPal was not asked to verify");
+    assert.equal(await storedEvent(event.id), undefined, "the event was not recorded");
+  });
+  assert.equal((await storedSubscription(rowId)).status, "APPROVAL_PENDING");
+  assert.equal((await call(browser, "POST", "/api/proposals/draft", {})).status, 402);
+});
+
+dbTest("a verified ACTIVATED webhook grants Pro only once PayPal itself reports the subscription ACTIVE", async () => {
+  const { browser } = await registered();
+  const { paypalId, rowId } = await subscribed(browser);
+  // The event claims activation, but PayPal still says APPROVAL_PENDING.
+  const early = subscriptionEvent("BILLING.SUBSCRIPTION.ACTIVATED", paypalId, rowId);
+  assert.equal((await deliver(early)).status, 200);
+  assert.equal((await storedEvent(early.id)).status, "PROCESSED");
+  assert.equal((await storedSubscription(rowId)).status, "APPROVAL_PENDING");
+  assert.equal((await call(browser, "POST", "/api/proposals/draft", {})).status, 402);
+
+  paypal.setStatus(paypalId, "ACTIVE");
+  assert.equal((await deliver(subscriptionEvent("BILLING.SUBSCRIPTION.ACTIVATED", paypalId, rowId))).status, 200);
+  const current = await call(browser, "GET", "/api/subscriptions/current");
+  assert.equal(current.body.subscription.status, "ACTIVE");
+  assert.equal(current.body.subscription.entitled, true);
+  assert.equal(current.body.subscription.nextBillingTime, "2026-11-18T10:00:00.000Z");
+  assert.equal((await call(browser, "POST", "/api/proposals/draft", {})).status, 200);
+});
+
+dbTest("BILLING.SUBSCRIPTION.PAYMENT.FAILED keeps Pro while PayPal still reports ACTIVE, and ends it once PayPal suspends", async () => {
+  const { browser, paypalId, rowId } = await activeSubscriber();
+  // PayPal retries a failed payment (payment_failure_threshold 3) and keeps
+  // the subscription ACTIVE meanwhile.
+  const firstFailure = subscriptionEvent("BILLING.SUBSCRIPTION.PAYMENT.FAILED", paypalId, rowId);
+  assert.equal((await deliver(firstFailure)).status, 200);
+  assert.equal((await storedEvent(firstFailure.id)).status, "PROCESSED");
+  assert.equal((await call(browser, "POST", "/api/proposals/draft", {})).status, 200, "one failed payment does not remove access");
+
+  paypal.setStatus(paypalId, "SUSPENDED");
+  assert.equal((await deliver(subscriptionEvent("BILLING.SUBSCRIPTION.PAYMENT.FAILED", paypalId, rowId))).status, 200);
+  const draft = await call(browser, "POST", "/api/proposals/draft", {});
+  assert.equal(draft.status, 402);
+  assert.equal(draft.body.subscriptionStatus, "SUSPENDED");
+});
+
+dbTest("a recurring PAYMENT.SALE.COMPLETED is linked by billing_agreement_id and refreshes the subscription, but never grants access", async () => {
+  const { browser, paypalId, rowId } = await activeSubscriber();
+  // PayPal collected the monthly payment and moved the next billing date.
+  paypal.subscriptions.get(paypalId)!.billing_info = { next_billing_time: "2026-12-18T10:00:00Z" };
+  const paid = saleEvent("PAYMENT.SALE.COMPLETED", {
+    id: saleId(),
+    state: "completed",
+    billing_agreement_id: paypalId,
+    amount: { total: "5.00", currency: "USD" },
+  });
+  const lookups = paypal.count("GET", `/v1/billing/subscriptions/${paypalId}`);
+  assert.deepEqual((await deliver(paid)).body, { received: true });
+  assert.equal(paypal.count("GET", `/v1/billing/subscriptions/${paypalId}`), lookups + 1, "the subscription was re-read from PayPal");
+  assert.equal((await storedEvent(paid.id)).status, "PROCESSED");
+  const stored = await storedSubscription(rowId);
+  assert.equal(stored.status, "ACTIVE");
+  assert.equal(stored.next_billing_time.toISOString(), "2026-12-18T10:00:00.000Z");
+  const audit = await pool!.query(
+    `SELECT metadata FROM audit_logs WHERE action = 'webhook.process' AND resource_id = $1 ORDER BY id DESC LIMIT 1`,
+    [rowId],
+  );
+  assert.equal(audit.rows[0].metadata.eventType, "PAYMENT.SALE.COMPLETED");
+  assert.equal(audit.rows[0].metadata.paymentState, "completed");
+  assert.equal(JSON.stringify(audit.rows[0].metadata).includes("5.00"), false, "no payment amount is stored");
+
+  // A payment for a suspended subscription does not bring Pro back:
+  // only PayPal's subscription status does.
+  paypal.setStatus(paypalId, "SUSPENDED");
+  const late = saleEvent("PAYMENT.SALE.COMPLETED", { id: saleId(), state: "completed", billing_agreement_id: paypalId });
+  assert.equal((await deliver(late)).status, 200);
+  assert.equal((await storedSubscription(rowId)).status, "SUSPENDED");
+  assert.equal((await call(browser, "POST", "/api/proposals/draft", {})).status, 402);
+
+  // A payment for a subscription this server does not know is ignored.
+  const stranger = saleEvent("PAYMENT.SALE.COMPLETED", { id: saleId(), state: "completed", billing_agreement_id: "I-SOMEONEELSE01" });
+  assert.equal((await deliver(stranger)).body.ignored, true);
+  assert.equal((await storedEvent(stranger.id)).error, "unknown subscription");
+});
+
+dbTest("PAYMENT.SALE.REFUNDED and REVERSED are linked through PayPal's own sale record; access follows PayPal's subscription status", async () => {
+  const { browser, paypalId, rowId } = await activeSubscriber();
+  const sale = saleId();
+  paypal.sales.set(sale, { id: sale, state: "refunded", billing_agreement_id: paypalId });
+
+  // A refund names only the sale; the server asks PayPal which subscription it paid.
+  const refund = saleEvent("PAYMENT.SALE.REFUNDED", { id: saleId(), state: "completed", sale_id: sale });
+  const saleLookups = paypal.count("GET", `/v1/payments/sale/${sale}`);
+  assert.equal((await deliver(refund)).status, 200);
+  assert.equal(paypal.count("GET", `/v1/payments/sale/${sale}`), saleLookups + 1);
+  assert.equal((await storedEvent(refund.id)).status, "PROCESSED");
+  assert.equal((await call(browser, "POST", "/api/proposals/draft", {})).status, 200, "PayPal still reports ACTIVE");
+
+  // A reversal after the merchant cancelled the subscription in PayPal.
+  paypal.setStatus(paypalId, "CANCELLED");
+  const reversal = saleEvent("PAYMENT.SALE.REVERSED", { id: sale, state: "reversed" });
+  assert.equal((await deliver(reversal)).status, 200);
+  assert.equal((await storedEvent(reversal.id)).status, "PROCESSED");
+  const draft = await call(browser, "POST", "/api/proposals/draft", {});
+  assert.equal(draft.status, 402);
+  assert.equal(draft.body.subscriptionStatus, "CANCELLED");
+  assert.equal((await storedSubscription(rowId)).status, "CANCELLED");
+
+  // A refund of a sale PayPal does not know (or that is not a subscription
+  // payment) is acknowledged and ignored.
+  const unknownRefund = saleEvent("PAYMENT.SALE.REFUNDED", { id: saleId(), state: "completed", sale_id: saleId() });
+  assert.equal((await deliver(unknownRefund)).body.ignored, true);
+  assert.equal((await storedEvent(unknownRefund.id)).error, "not a subscription payment");
+});
+
+dbTest("unknown event types and unusable resource ids are acknowledged, recorded as IGNORED, and touch nothing", async () => {
+  const { paypalId, rowId } = await activeSubscriber();
+  const lookups = () => paypal.calls.filter((c) => c.method === "GET" && c.path.startsWith("/v1/")).length;
+  const before = lookups();
+
+  const dispute = { id: `WH-DSP-${randomBytes(3).toString("hex")}`, event_type: "CUSTOMER.DISPUTE.CREATED", resource: { id: paypalId } };
+  assert.deepEqual((await deliver(dispute)).body, { received: true, ignored: true });
+  assert.deepEqual(await storedEvent(dispute.id), { status: "IGNORED", attempts: 1, error: "unsupported event type" });
+
+  // A subscription id that is not PayPal's I-... format never reaches an API path.
+  const odd = subscriptionEvent("BILLING.SUBSCRIPTION.UPDATED", "../../v1/payments/x");
+  assert.equal((await deliver(odd)).body.ignored, true);
+  assert.equal((await storedEvent(odd.id)).error, "no valid subscription id");
+
+  assert.equal(lookups(), before, "PayPal was not asked about either event");
+  assert.equal((await storedSubscription(rowId)).status, "ACTIVE");
+
+  // UPDATED is handled like every subscription event: PayPal is re-read.
+  const updated = subscriptionEvent("BILLING.SUBSCRIPTION.UPDATED", paypalId, rowId);
+  assert.equal((await deliver(updated)).status, 200);
+  assert.equal((await storedEvent(updated.id)).status, "PROCESSED");
+});
+
+dbTest("malformed deliveries are refused with 400 before PayPal is asked to verify them", async () => {
+  const before = verifyCalls();
+  const valid = subscriptionEvent("BILLING.SUBSCRIPTION.ACTIVATED", "I-MALFORMED0001");
+  const cases: Array<[string, string]> = [
+    ["not JSON", "{ this is not json"],
+    ["no event id", JSON.stringify({ ...valid, id: undefined })],
+    ["empty event id", JSON.stringify({ ...valid, id: "" })],
+    ["no event type", JSON.stringify({ ...valid, event_type: undefined })],
+    ["event type not a string", JSON.stringify({ ...valid, event_type: 42 })],
+    ["resource not an object", JSON.stringify({ ...valid, resource: "I-MALFORMED0001" })],
+    ["a JSON array", JSON.stringify([valid])],
+  ];
+  for (const [label, raw] of cases) {
+    const response = await deliver({}, raw);
+    assert.equal(response.status, 400, label);
+  }
+  assert.equal(verifyCalls(), before, "no malformed delivery reached PayPal");
+  const recorded = await pool!.query("SELECT COUNT(*)::int AS n FROM paypal_webhook_events WHERE resource_id = 'I-MALFORMED0001'");
+  assert.equal(recorded.rows[0].n, 0);
+});
+
+dbTest("a database failure while recording or processing an event makes PayPal retry, and the retry applies it once", async () => {
+  const { browser } = await registered();
+  const { paypalId, rowId } = await subscribed(browser);
+  paypal.setStatus(paypalId, "ACTIVE");
+
+  let failConnect = false;
+  let failLookup = false;
+  const failure = () => Promise.reject(new Error("connection to the database was lost"));
+  const flaky = {
+    connect: () => (failConnect ? failure() : pool!.connect()),
+    query: (sql: string, values?: unknown[]) =>
+      failLookup && sql.includes("paypal_subscription_id IS NULL AND id::text") ? failure() : pool!.query(sql, values),
+  } as unknown as Pool;
+  const lines: string[] = [];
+  const logger = { error: (...a: unknown[]) => lines.push(JSON.stringify(a)), warn() {}, info() {} };
+
+  await withWebhookApp({ pool: flaky, logger }, async (target) => {
+    // 1. The event cannot even be recorded: 503, nothing stored, nothing applied.
+    const first = subscriptionEvent("BILLING.SUBSCRIPTION.ACTIVATED", paypalId, rowId);
+    failConnect = true;
+    assert.equal((await deliver(first, undefined, target)).status, 503);
+    failConnect = false;
+    assert.equal(await storedEvent(first.id), undefined);
+    assert.equal((await storedSubscription(rowId)).status, "APPROVAL_PENDING");
+
+    // 2. Recorded, but processing fails: 500, the event is marked FAILED.
+    failLookup = true;
+    assert.equal((await deliver(first, undefined, target)).status, 500);
+    failLookup = false;
+    assert.equal((await storedEvent(first.id)).status, "FAILED");
+    assert.equal((await storedSubscription(rowId)).status, "APPROVAL_PENDING");
+    assert.equal((await call(browser, "POST", "/api/proposals/draft", {})).status, 402);
+
+    // 3. PayPal's redelivery succeeds and is applied once.
+    assert.deepEqual((await deliver(first, undefined, target)).body, { received: true });
+    assert.deepEqual(await storedEvent(first.id), { status: "PROCESSED", attempts: 2, error: null });
+    assert.equal((await storedSubscription(rowId)).status, "ACTIVE");
+    assert.equal((await deliver(first, undefined, target)).body.duplicate, true);
+  });
+  assert.equal((await call(browser, "POST", "/api/proposals/draft", {})).status, 200);
+  assert.ok(lines.some((line) => line.includes('"outcome":"retry"') && line.includes("database unavailable")));
+  assert.ok(lines.some((line) => line.includes('"outcome":"failed"')));
+});
+
+dbTest("every delivery logs its event id, type and outcome, and never secrets, ids of subscriptions, or payment details", async () => {
+  const { email, browser } = await registered();
+  const { paypalId, rowId } = await subscribed(browser);
+  paypal.setStatus(paypalId, "ACTIVE");
+  const lines: string[] = [];
+  const record = (...args: unknown[]) => lines.push(JSON.stringify(args));
+  await withWebhookApp({ logger: { error: record, warn: record, info: record } }, async (target) => {
+    const activated = subscriptionEvent("BILLING.SUBSCRIPTION.ACTIVATED", paypalId, rowId);
+    await deliver(activated, undefined, target);
+    await deliver(activated, undefined, target);
+    const payment = saleEvent("PAYMENT.SALE.COMPLETED", {
+      id: saleId(),
+      state: "completed",
+      billing_agreement_id: paypalId,
+      amount: { total: "5.00", currency: "USD" },
+      payer_email: email,
+    });
+    await deliver(payment, undefined, target);
+    await deliver({ id: `WH-X-${randomBytes(3).toString("hex")}`, event_type: "CHECKOUT.ORDER.APPROVED", resource: {} }, undefined, target);
+    paypal.verification = "FAILURE";
+    try {
+      await deliver(subscriptionEvent("BILLING.SUBSCRIPTION.CANCELLED", paypalId, rowId), undefined, target);
+    } finally {
+      paypal.verification = "SUCCESS";
+    }
+
+    const has = (eventId: string, outcome: string) =>
+      lines.some((line) => line.includes(`"eventId":"${eventId}"`) && line.includes(`"outcome":"${outcome}"`));
+    assert.ok(has(activated.id, "processed"));
+    assert.ok(has(activated.id, "duplicate"));
+    assert.ok(has(payment.id, "processed"));
+    assert.ok(lines.some((line) => line.includes('"eventType":"CHECKOUT.ORDER.APPROVED"') && line.includes('"outcome":"ignored"')));
+    assert.ok(lines.some((line) => line.includes('"outcome":"rejected"') && line.includes("invalid signature")));
+    assert.ok(lines.some((line) => line.includes('"status":"ACTIVE"')));
+  });
+  assert.equal(lines.length, 5, "one line per delivery");
+  const all = lines.join("\n");
+  for (const secret of ["FAKE-TOKEN", WEBHOOK_ID, "c2lnbmF0dXJl", CERT, paypalId, rowId, email, "5.00", "payer"]) {
+    assert.equal(all.includes(secret), false, `the log must not contain ${secret}`);
+  }
 });
 
 // ---- AI routes: authentication vs authorization vs subscription ---------------

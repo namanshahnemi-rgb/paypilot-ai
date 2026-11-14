@@ -17,6 +17,7 @@ import { safeMetadata } from "./auditLog.js";
 import {
   SUBSCRIPTION_OFFER,
   createPayPalSubscription,
+  getPayPalSaleSubscriptionId,
   getPayPalSubscription,
   isPayPalCertUrl,
   planDefinition,
@@ -287,4 +288,21 @@ test("a webhook whose certificate is not on paypal.com is refused without asking
   assert.equal(genuine, false);
   assert.equal(paypal.calls.length, 0);
   assert.equal(readWebhookHeaders(() => undefined), undefined);
+});
+
+test("a sale is linked to its subscription only through PayPal's own sale record", async () => {
+  const sale = recordingFetch(() => new Response(JSON.stringify({ id: "SALE123456", state: "refunded", billing_agreement_id: "I-ABC123456" })));
+  assert.equal(await getPayPalSaleSubscriptionId(deps(sale.fetch), "SALE123456"), "I-ABC123456");
+  assert.equal(sale.calls[0]!.url, "https://api-m.sandbox.paypal.com/v1/payments/sale/SALE123456");
+  assert.equal(sale.calls[0]!.init.method, "GET");
+
+  // Not a subscription payment, or unknown to PayPal: no subscription.
+  const oneTime = recordingFetch(() => new Response(JSON.stringify({ id: "SALE123456", state: "completed" })));
+  assert.equal(await getPayPalSaleSubscriptionId(deps(oneTime.fetch), "SALE123456"), undefined);
+  const missing = recordingFetch(() => new Response("{}", { status: 404 }));
+  assert.equal(await getPayPalSaleSubscriptionId(deps(missing.fetch), "SALE123456"), undefined);
+
+  // Any other failure is an error, so the webhook is retried later.
+  const down = recordingFetch(() => new Response("{}", { status: 503 }));
+  await assert.rejects(getPayPalSaleSubscriptionId(deps(down.fetch), "SALE123456"), /HTTP 503/);
 });

@@ -286,6 +286,25 @@ export async function cancelPayPalSubscription(deps: PayPalApiDeps, id: string, 
   });
 }
 
+// ---- Subscription payments -------------------------------------------------
+
+// The subscription (billing agreement) a PayPal sale belongs to, read from
+// PayPal itself: GET /v1/payments/sale/{id} reports billing_agreement_id for
+// a subscription payment. Undefined when the sale is unknown to PayPal (404)
+// or is not a subscription payment. Used to link a refund or reversal, whose
+// webhook carries only the sale id, to a subscription.
+export async function getPayPalSaleSubscriptionId(deps: PayPalApiDeps, saleId: string): Promise<string | undefined> {
+  let sale: unknown;
+  try {
+    sale = await callPayPal(deps, "GET", `/v1/payments/sale/${encodeURIComponent(saleId)}`);
+  } catch (error) {
+    if (error instanceof PayPalApiError && error.paypalStatus === 404) return undefined;
+    throw error;
+  }
+  const agreement = (sale as { billing_agreement_id?: unknown } | undefined)?.billing_agreement_id;
+  return typeof agreement === "string" ? agreement : undefined;
+}
+
 // ---- Webhooks -------------------------------------------------------------
 
 export const WEBHOOK_HEADERS = {

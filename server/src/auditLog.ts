@@ -39,6 +39,7 @@ const ALLOWED_METADATA_KEYS = new Set([
   "previousStatus",
   "eventType",
   "eventId",
+  "paymentState", // A PayPal sale's state (completed, refunded, reversed); never amounts or payer data.
   "source",
   "sessions",
   "duplicate",

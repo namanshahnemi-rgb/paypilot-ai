@@ -22,6 +22,7 @@ import {
   cancelPayPalSubscription,
   createPayPalSubscription,
   fetchPlan,
+  getPayPalSaleSubscriptionId,
   getPayPalSubscription,
   planProblems,
   readWebhookHeaders,
@@ -33,7 +34,11 @@ import {
 import { createRateLimiter } from "./rateLimit.js";
 import { withTransaction } from "./transaction.js";
 
-type Logger = { error: (...args: unknown[]) => void; warn?: (...args: unknown[]) => void };
+type Logger = {
+  error: (...args: unknown[]) => void;
+  warn?: (...args: unknown[]) => void;
+  info?: (...args: unknown[]) => void;
+};
 
 export const WEBHOOK_PATH = "/api/paypal/webhooks";
 
@@ -497,6 +502,51 @@ export function createSubscriptionModule(options: SubscriptionModuleOptions) {
     );
   }
 
+  // PayPal ids that are safe to put in an API path and a database lookup.
+  const SUBSCRIPTION_ID = /^I-[A-Z0-9]{6,40}$/;
+  const SALE_ID = /^[A-Z0-9]{6,40}$/;
+  // Subscription payment events. Like every event, each one only triggers a
+  // re-read of the subscription from PayPal: a payment never grants, extends
+  // or removes Pro by itself; PayPal's subscription status decides.
+  const SALE_EVENTS = new Set(["PAYMENT.SALE.COMPLETED", "PAYMENT.SALE.REFUNDED", "PAYMENT.SALE.REVERSED"]);
+
+  const text = (value: unknown) => (typeof value === "string" && value.length <= 100 ? value : undefined);
+
+  type Outcome = "processed" | "ignored" | "duplicate" | "rejected" | "retry" | "failed";
+
+  // One log line per delivery: the event id, type and outcome (with a short
+  // reason or the resulting status). Never the payload, the headers, PayPal's
+  // answers, or any payment detail.
+  function logDelivery(outcome: Outcome, fields: { eventId?: string; eventType?: string; reason?: string; status?: string }) {
+    const line = { outcome, ...fields };
+    if (outcome === "retry" || outcome === "failed") logger.error("PayPal webhook:", line);
+    else if (outcome === "rejected") (logger.warn ?? logger.error)("PayPal webhook:", line);
+    else (logger.info ?? logger.warn)?.("PayPal webhook:", line);
+  }
+
+  // The PayPal subscription an event is about, or why it is not about one.
+  // A refund or reversal names only the sale, so PayPal is asked which
+  // subscription that sale paid (with the server's own credentials).
+  async function subscriptionIdOf(
+    eventType: string,
+    resource: Record<string, unknown>,
+  ): Promise<{ subscriptionId: string } | { ignore: string }> {
+    let id: string | undefined;
+    if (eventType.startsWith("BILLING.SUBSCRIPTION.")) {
+      id = text(resource.id);
+    } else if (SALE_EVENTS.has(eventType)) {
+      id = text(resource.billing_agreement_id);
+      if (!id && eventType !== "PAYMENT.SALE.COMPLETED") {
+        const saleId = text(resource.sale_id) ?? text(resource.id);
+        if (saleId && SALE_ID.test(saleId)) id = await getPayPalSaleSubscriptionId(payPal, saleId);
+      }
+      if (!id) return { ignore: "not a subscription payment" };
+    } else {
+      return { ignore: "unsupported event type" };
+    }
+    return id && SUBSCRIPTION_ID.test(id) ? { subscriptionId: id } : { ignore: "no valid subscription id" };
+  }
+
   router.post(WEBHOOK_PATH, webhookLimiter, track(async (req, res) => {
     const webhookId = options.webhookId;
     if (!webhookId) {
@@ -507,6 +557,7 @@ export function createSubscriptionModule(options: SubscriptionModuleOptions) {
     const headers = readWebhookHeaders((name) => req.get(name));
     const event = EventSchema.safeParse(req.body);
     if (!rawBody || !headers || !event.success) {
+      logDelivery("rejected", { reason: "malformed delivery" });
       await tryAudit(pool, {
         actorUserId: null,
         action: "webhook.process",
@@ -516,30 +567,43 @@ export function createSubscriptionModule(options: SubscriptionModuleOptions) {
       });
       return res.status(400).json({ error: "Not a valid PayPal webhook delivery." });
     }
+    const { id: eventId, event_type: eventType } = event.data;
+    const resource = (event.data.resource ?? {}) as Record<string, unknown>;
 
     let genuine: boolean;
     try {
       genuine = await verifyWebhookSignature(payPal, { headers, rawBody, webhookId });
     } catch (error) {
       logger.error("Webhook signature check failed:", error instanceof Error ? error.message : "unknown error");
+      logDelivery("retry", { eventId, eventType, reason: "signature check unavailable" });
       // PayPal retries deliveries that do not get a 2xx answer.
       return res.status(503).json({ error: "Could not verify the delivery; retry later." });
     }
     if (!genuine) {
+      logDelivery("rejected", { eventId, eventType, reason: "invalid signature" });
       await tryAudit(pool, {
         actorUserId: null,
         action: "webhook.process",
         resourceType: "paypal_webhook",
-        resourceId: event.data.id,
+        resourceId: eventId,
         outcome: "failure",
-        metadata: { reason: "invalid_signature", eventType: event.data.event_type },
+        metadata: { reason: "invalid_signature", eventType },
       });
       return res.status(400).json({ error: "The webhook signature is not valid." });
     }
 
-    const { id: eventId, event_type: eventType, resource } = event.data;
-    const claim = await claimEvent(event.data);
+    // From here on the event is genuine. Recording it first makes a
+    // redelivery (or a concurrent second delivery) a no-op.
+    let claim: Awaited<ReturnType<typeof claimEvent>>;
+    try {
+      claim = await claimEvent(event.data);
+    } catch (error) {
+      logger.error("Webhook event could not be recorded:", error instanceof Error ? error.message : "unknown error");
+      logDelivery("retry", { eventId, eventType, reason: "database unavailable" });
+      return res.status(503).json({ error: "The event could not be recorded; retry later." });
+    }
     if (claim === "duplicate") {
+      logDelivery("duplicate", { eventId, eventType });
       await tryAudit(pool, {
         actorUserId: null,
         action: "webhook.process",
@@ -550,37 +614,53 @@ export function createSubscriptionModule(options: SubscriptionModuleOptions) {
       });
       return res.json({ received: true, duplicate: true });
     }
-    if (claim === "busy") return res.status(503).json({ error: "This event is already being processed; retry later." });
+    if (claim === "busy") {
+      logDelivery("retry", { eventId, eventType, reason: "already being processed" });
+      return res.status(503).json({ error: "This event is already being processed; retry later." });
+    }
 
     try {
-      if (!eventType.startsWith("BILLING.SUBSCRIPTION.") || !resource?.id) {
-        await finishEvent(eventId, "IGNORED", "not a subscription event");
+      const link = await subscriptionIdOf(eventType, resource);
+      if ("ignore" in link) {
+        await finishEvent(eventId, "IGNORED", link.ignore);
+        logDelivery("ignored", { eventId, eventType, reason: link.ignore });
         return res.json({ received: true, ignored: true });
       }
+      // A subscription event may name the record by custom_id before the
+      // PayPal id is stored; a payment event is matched by the PayPal id only.
+      const customId = eventType.startsWith("BILLING.SUBSCRIPTION.") ? text(resource.custom_id) : undefined;
       const row = (
         await pool.query<SubscriptionRow>(
           `SELECT * FROM subscriptions
             WHERE paypal_subscription_id = $1
                OR (paypal_subscription_id IS NULL AND id::text = $2)
             LIMIT 1`,
-          [resource.id, resource.custom_id ?? ""],
+          [link.subscriptionId, customId ?? ""],
         )
       ).rows[0];
       if (!row) {
         await finishEvent(eventId, "IGNORED", "unknown subscription");
+        logDelivery("ignored", { eventId, eventType, reason: "unknown subscription" });
         return res.json({ received: true, ignored: true });
       }
       // The event says something changed; PayPal's API says what is true now.
-      const snapshot = await getPayPalSubscription(payPal, resource.id);
+      const snapshot = await getPayPalSubscription(payPal, link.subscriptionId);
       const updated = await applySnapshot(row.id, snapshot, "webhook");
       await finishEvent(eventId, "PROCESSED");
+      const status = updated?.status ?? snapshot.status;
+      logDelivery("processed", { eventId, eventType, status });
       await tryAudit(pool, {
         actorUserId: row.user_id,
         action: "webhook.process",
         resourceType: "subscription",
         resourceId: row.id,
         outcome: "success",
-        metadata: { eventType, eventId, status: updated?.status ?? snapshot.status },
+        metadata: {
+          eventType,
+          eventId,
+          status,
+          ...(SALE_EVENTS.has(eventType) && text(resource.state) ? { paymentState: text(resource.state) } : {}),
+        },
       });
       return res.json({ received: true });
     } catch (error) {
@@ -596,8 +676,10 @@ export function createSubscriptionModule(options: SubscriptionModuleOptions) {
       });
       if (error instanceof SubscriptionMismatch) {
         // Retrying cannot fix a mismatch; acknowledge and keep the record.
+        logDelivery("ignored", { eventId, eventType, reason });
         return res.json({ received: true, ignored: true });
       }
+      logDelivery("failed", { eventId, eventType, reason: "processing failed; PayPal will retry" });
       return res.status(500).json({ error: "The event could not be processed; retry later." });
     }
   }));

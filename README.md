@@ -90,10 +90,12 @@ An older stored state never replaces a newer one, and a `CANCELLED` or `EXPIRED`
 
 ### Webhooks: implemented but **not verified**
 
-`POST /api/paypal/webhooks` accepts `BILLING.SUBSCRIPTION.*` events.
-- **Verification:** each delivery is confirmed with PayPal's signature-verification API, using the exact bytes received.
-- **Idempotency:** every event ID is stored, so a redelivered event is ignored.
+`POST /api/paypal/webhooks` accepts `BILLING.SUBSCRIPTION.*` events (including `CREATED`, `ACTIVATED`, `UPDATED`, `CANCELLED`, `SUSPENDED`, `EXPIRED` and `PAYMENT.FAILED`) and the subscription payment events `PAYMENT.SALE.COMPLETED`, `PAYMENT.SALE.REFUNDED` and `PAYMENT.SALE.REVERSED`. Other event types are acknowledged and ignored.
+- **Verification:** each delivery is confirmed with PayPal's signature-verification API, using the exact bytes received. Without `PAYPAL_WEBHOOK_ID` every delivery is refused (503).
+- **Idempotency:** every event ID is stored, so a redelivered event is ignored. A delivery that fails (for example, the database is down) gets an error, so PayPal retries it.
 - **Order:** a verified event only prompts the backend to re-read the subscription from PayPal, so events that arrive out of order can't restore an older state.
+- **Payments:** a payment event is linked to its subscription through the sale's `billing_agreement_id`. A refund or reversal names only the sale, so the backend asks PayPal which subscription that sale paid. A payment event never grants, extends or removes Pro by itself; the subscription status PayPal reports decides.
+- **Logs:** one line per delivery with the event ID, event type and outcome; never the payload, headers or payment details.
 
 This behaviour is covered by automated tests with a mocked PayPal. **Real PayPal webhook delivery has not been tested.** PayPal can't reach `localhost`, and no `PAYPAL_WEBHOOK_ID` is configured. Locally, subscription changes made outside the app reach it through **Check status**, or the re-check when a Pro feature is used, not through webhooks.
 
